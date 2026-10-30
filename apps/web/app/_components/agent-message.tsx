@@ -76,10 +76,13 @@ type OnInputResponses = (
  * @returns The message.
  */
 export function AgentMessage({
+  canRespond,
   isStreaming,
   message,
   onInputResponses,
 }: {
+  /** Whether an interaction remains answerable. */
+  readonly canRespond: (interactionId: string) => boolean;
   /** Whether this message is the one currently streaming. */
   readonly isStreaming: boolean;
   /** The message to render. */
@@ -105,6 +108,7 @@ export function AgentMessage({
         {message.parts.map((part, index) =>
           hasAssistantText && part.type === "reasoning" ? null : (
             <AgentMessagePart
+              canRespond={canRespond}
               key={partKey(part, index)}
               onInputResponses={onInputResponses}
               part={part}
@@ -129,10 +133,13 @@ export function AgentMessage({
  * @returns The rendered part, or `null` for parts with nothing to show.
  */
 function AgentMessagePart({
+  canRespond,
   onInputResponses,
   part,
   showCaret,
 }: {
+  /** Whether an interaction remains answerable. */
+  readonly canRespond: (interactionId: string) => boolean;
   /** Submits answers to questions and approvals. */
   readonly onInputResponses: OnInputResponses;
   /** The part to render. */
@@ -162,6 +169,7 @@ function AgentMessagePart({
     case "interaction": {
       return (
         <InteractionPrompt
+          canRespond={canRespond}
           interaction={part}
           onInputResponses={onInputResponses}
         />
@@ -204,6 +212,7 @@ function AgentMessagePart({
           </Tool>
           {part.interaction === undefined ? null : (
             <InteractionPrompt
+              canRespond={canRespond}
               interaction={part.interaction}
               onInputResponses={onInputResponses}
               tool={part}
@@ -479,10 +488,13 @@ function AttachmentPart({
  * @returns The authorization card.
  */
 function InteractionPrompt({
+  canRespond,
   interaction,
   onInputResponses,
   tool,
 }: {
+  /** Whether an interaction remains answerable. */
+  readonly canRespond: (interactionId: string) => boolean;
   readonly interaction: Interaction | EveInteractionPart;
   readonly onInputResponses: OnInputResponses;
   readonly tool?: EveToolPart;
@@ -490,7 +502,7 @@ function InteractionPrompt({
   if (interaction.request.kind === "question") {
     return (
       <QuestionRequest
-        canRespond={interaction.status === "open"}
+        canRespond={canRespond(interaction.interactionId)}
         inputRequest={interaction}
         inputResponse={interaction.answer}
         onInputResponses={onInputResponses}
@@ -504,6 +516,7 @@ function InteractionPrompt({
 
   return (
     <InputRequestActions
+      canRespond={canRespond(interaction.interactionId)}
       interaction={interaction}
       onInputResponses={onInputResponses}
       tool={tool}
@@ -645,10 +658,13 @@ function settledOutcome(
  * @returns The approval card, or `null` when the tool call asks for nothing.
  */
 function InputRequestActions({
+  canRespond,
   interaction,
   onInputResponses,
   tool,
 }: {
+  /** Whether the interaction remains answerable. */
+  readonly canRespond: boolean;
   /** The interaction to show. */
   readonly interaction: Interaction;
   /** Submits the chosen option. */
@@ -713,7 +729,7 @@ function InputRequestActions({
       <div className="flex flex-wrap gap-2">
         {interaction.request.options?.map((option, index) => (
           <Button
-            disabled={interaction.status !== "open"}
+            disabled={!canRespond}
             key={option.id}
             onClick={() => {
               void onInputResponses([

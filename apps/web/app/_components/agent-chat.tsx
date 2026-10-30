@@ -1,7 +1,11 @@
 import { useHotkey } from "@tanstack/react-hotkeys";
-import { ClientError } from "eve/client";
+import { ClientError, SessionNotActiveError } from "eve/client";
 import type { MessagePart } from "eve/client";
-import { activeTurn } from "eve/events";
+import {
+  activeTurn,
+  interaction,
+  session as sessionObservation,
+} from "eve/events";
 import { useEveAgent } from "eve/react";
 import type { UseEveAgentReturn } from "eve/react";
 import { AlertCircleIcon, BrainIcon, PlusIcon, SquareIcon } from "lucide-react";
@@ -50,6 +54,7 @@ interface ChatView {
   readonly errorMessage: string | undefined;
   /** The empty assistant message hidden while the thinking indicator stands in for it. */
   readonly hiddenMessageId: string | undefined;
+  readonly hasActiveTurn: boolean;
   readonly isBusy: boolean;
   readonly isResuming: boolean;
   readonly showConversationLayout: boolean;
@@ -114,7 +119,8 @@ export function AgentChat({
 
   useChatHotkeys({
     composerRef,
-    isBusy: view.isBusy,
+    hasActiveTurn: view.hasActiveTurn,
+    isResuming: view.isResuming,
     onCancel: () => {
       void requestCancellation();
     },
@@ -149,7 +155,7 @@ export function AgentChat({
       />
       <ComposerAction
         hasInputText={hasInputText}
-        isBusy={view.isBusy}
+        hasActiveTurn={view.hasActiveTurn}
         isResuming={view.isResuming}
         onCancel={() => {
           void requestCancellation();
@@ -227,20 +233,23 @@ export function AgentChat({
 
 /**
  * Registers the chat's keyboard shortcuts: `/` or `Mod+K` focuses the composer,
- * `Escape` stops a streaming reply, and `Mod+Shift+O` starts a new chat.
+ * `Escape` stops an active turn, and `Mod+Shift+O` starts a new chat.
  *
  * @param options - The composer and the active turn's state.
  */
 function useChatHotkeys({
   composerRef,
-  isBusy,
+  hasActiveTurn,
+  isResuming,
   onCancel,
 }: {
   /** The composer's textarea. */
   readonly composerRef: RefObject<HTMLTextAreaElement | null>;
-  /** Whether a reply is streaming, which enables `Escape`. */
-  readonly isBusy: boolean;
-  /** Stops the streaming reply. */
+  /** Whether a turn is open, which enables `Escape`. */
+  readonly hasActiveTurn: boolean;
+  /** Whether the session is still catching up. */
+  readonly isResuming: boolean;
+  /** Stops the active turn. */
   readonly onCancel: () => void;
 }) {
   const focusComposer = () => {
@@ -248,7 +257,7 @@ function useChatHotkeys({
   };
   useHotkey("/", focusComposer);
   useHotkey("Mod+K", focusComposer);
-  useHotkey("Escape", onCancel, { enabled: isBusy });
+  useHotkey("Escape", onCancel, { enabled: hasActiveTurn && !isResuming });
   useHotkey("Mod+Shift+O", () => {
     window.location.assign("/s");
   });
@@ -322,6 +331,7 @@ function getChatView(
 ): ChatView {
   const isBusy = agent.status === "busy";
   const isResuming = agent.status === "resuming";
+  const hasActiveTurn = activeTurn(agent.view) !== undefined;
   const pending = getPendingAssistant(agent, isBusy);
   const turnFailure =
     isBusy || isResuming ? undefined : getLatestTurnFailure(agent.events);
@@ -333,6 +343,7 @@ function getChatView(
     activeSessionId: sessionId ?? agent.session?.sessionId,
     errorMessage,
     hiddenMessageId: pending.hiddenMessageId,
+    hasActiveTurn,
     isBusy,
     isResuming,
     showConversationLayout: isResuming || hasConversationContent,
@@ -433,6 +444,9 @@ function ChatConversation({
         {messages.map((message) =>
           message.id === view.hiddenMessageId ? null : (
             <AgentMessage
+              canRespond={(interactionId) =>
+                canRespondToInteraction(agent, interactionId, view.isResuming)
+              }
               isStreaming={message.metadata?.status === "streaming"}
               key={message.id}
               message={message}
@@ -458,14 +472,14 @@ function ChatConversation({
  */
 function ComposerAction({
   hasInputText,
-  isBusy,
+  hasActiveTurn,
   isResuming,
   onCancel,
 }: {
   /** Whether the textarea has text. */
   readonly hasInputText: boolean;
-  /** Whether a turn is running. */
-  readonly isBusy: boolean;
+  /** Whether a turn is open. */
+  readonly hasActiveTurn: boolean;
   /** Whether the session is still catching up. */
   readonly isResuming: boolean;
   /** Cancels the running turn. */
@@ -474,7 +488,7 @@ function ComposerAction({
   const attachments = usePromptInputAttachments();
   const canSubmit = hasInputText || attachments.files.length > 0;
 
-  if (!isBusy || canSubmit) {
+  if (!hasActiveTurn || isResuming || canSubmit) {
     return <PromptInputSubmit disabled={isResuming || !canSubmit} />;
   }
 
@@ -487,6 +501,27 @@ function ComposerAction({
     >
       <SquareIcon className="size-3 fill-current" />
     </PromptInputButton>
+  );
+}
+
+/**
+ * Whether a projected interaction can still receive an answer.
+ *
+ * @param agent - The current agent state.
+ * @param interactionId - The interaction to check.
+ * @param isResuming - Whether the session is still catching up.
+ * @returns Whether the interaction is currently answerable.
+ */
+function canRespondToInteraction(
+  agent: EveAgent,
+  interactionId: string,
+  isResuming: boolean
+): boolean {
+  return (
+    !isResuming &&
+    !SessionNotActiveError.is(agent.error) &&
+    sessionObservation(agent.view).status !== "ended" &&
+    interaction(agent.view, interactionId)?.status === "open"
   );
 }
 
