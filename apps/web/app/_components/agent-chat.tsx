@@ -3,9 +3,12 @@ import { ClientError, SessionNotActiveError } from "eve/client";
 import type { MessagePart } from "eve/client";
 import {
   activeTurn,
+  conversation,
+  failure,
   interaction,
   session as sessionObservation,
 } from "eve/events";
+import type { Answer } from "eve/events";
 import { useEveAgent } from "eve/react";
 import type { UseEveAgentReturn } from "eve/react";
 import { AlertCircleIcon, BrainIcon, PlusIcon, SquareIcon } from "lucide-react";
@@ -35,12 +38,9 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
 import { AgentMessage } from "./agent-message";
-import type { AgentInputResponse } from "./agent-message";
 
 const DEFAULT_AGENT_NAME = "eve TanStack Agent";
 const AGENT_NAME = WEB_CHAT_AGENT ?? DEFAULT_AGENT_NAME;
-
-type EveAgent = UseEveAgentReturn;
 
 /** Whether to show the thinking indicator, and the empty assistant message it replaces. */
 interface PendingAssistant {
@@ -315,7 +315,7 @@ async function readAccessStatus(): Promise<AccessStatus | null> {
  * @returns The derived {@link ChatView}.
  */
 function getChatView(
-  agent: EveAgent,
+  agent: UseEveAgentReturn,
   {
     actionError,
     sessionId,
@@ -334,7 +334,7 @@ function getChatView(
   const hasActiveTurn = activeTurn(agent.view) !== undefined;
   const pending = getPendingAssistant(agent, isBusy);
   const turnFailure =
-    isBusy || isResuming ? undefined : getLatestTurnFailure(agent.events);
+    isBusy || isResuming ? undefined : getLatestTurnFailure(agent.view);
   const errorMessage = actionError ?? agent.error?.message ?? turnFailure;
   const hasConversationContent =
     sessionless || agent.messages.length > 0 || errorMessage !== undefined;
@@ -360,7 +360,7 @@ function getChatView(
  * @returns Whether to show the indicator, and the message ID it hides.
  */
 function getPendingAssistant(
-  agent: EveAgent,
+  agent: UseEveAgentReturn,
   isBusy: boolean
 ): PendingAssistant {
   const lastMessage = agent.messages.at(-1);
@@ -416,13 +416,11 @@ function ChatConversation({
   view,
 }: {
   /** The `useEveAgent` result. */
-  readonly agent: EveAgent;
+  readonly agent: UseEveAgentReturn;
   /** Whether the page opened on an existing session. */
   readonly isInitialSession: boolean;
   /** Submits answers to questions and approvals. */
-  readonly onInputResponses: (
-    responses: readonly AgentInputResponse[]
-  ) => Promise<void>;
+  readonly onInputResponses: (responses: readonly Answer[]) => Promise<void>;
   /** The derived {@link ChatView}. */
   readonly view: ChatView;
 }) {
@@ -513,7 +511,7 @@ function ComposerAction({
  * @returns Whether the interaction is currently answerable.
  */
 function canRespondToInteraction(
-  agent: EveAgent,
+  agent: UseEveAgentReturn,
   interactionId: string,
   isResuming: boolean
 ): boolean {
@@ -619,23 +617,18 @@ function PendingThinking() {
 /**
  * Finds the latest turn failure, ignoring failures a later turn or message superseded.
  *
- * @param events - The agent's event log.
+ * @param view - The projected session state.
  * @returns A user-facing failure message, or `undefined` when the latest turn did not fail.
  */
-function getLatestTurnFailure(events: EveAgent["events"]): string | undefined {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-
-    if (event.type === "turn.settled" && event.data.outcome === "failed") {
-      return event.data.error?.code === "MODEL_CALL_FAILED"
-        ? "The model is temporarily unavailable. Please try again."
-        : event.data.error?.message;
-    }
-
-    if (event.type === "turn.settled" || event.type === "delivery.consumed") {
-      return undefined;
-    }
-  }
-
-  return undefined;
+function getLatestTurnFailure(
+  view: UseEveAgentReturn["view"]
+): string | undefined {
+  const latestTurn = conversation(view).at(-1);
+  const turnFailure =
+    latestTurn?.outcome === "failed"
+      ? failure(view, latestTurn.turnId)
+      : failure(view);
+  return turnFailure?.code === "MODEL_CALL_FAILED"
+    ? "The model is temporarily unavailable. Please try again."
+    : turnFailure?.message;
 }

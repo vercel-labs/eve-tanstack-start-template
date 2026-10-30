@@ -2,7 +2,6 @@ import type { Spec } from "@json-render/react";
 import type { Answer } from "eve/events";
 import { signInEnding } from "eve/react";
 import type {
-  EveInteractionPart,
   EveMessage,
   EveMessagePart,
   EveToolPart,
@@ -61,13 +60,8 @@ import { cn } from "@/lib/utils";
 
 import { GeneratedUi, uiSpecSchema } from "./ui-registry";
 
-/** A visitor's answer to a question or approval request. */
-export type AgentInputResponse = Answer;
-
 type EveFilePart = Extract<EveMessagePart, { type: "file" }>;
-type OnInputResponses = (
-  responses: readonly AgentInputResponse[]
-) => void | Promise<void>;
+type OnInputResponses = (responses: readonly Answer[]) => void | Promise<void>;
 
 /**
  * Renders one chat message and each of its parts.
@@ -176,6 +170,16 @@ function AgentMessagePart({
       );
     }
     case "tool": {
+      if (part.interaction?.request.kind === "question") {
+        return (
+          <InteractionPrompt
+            canRespond={canRespond}
+            interaction={part.interaction}
+            onInputResponses={onInputResponses}
+            tool={part}
+          />
+        );
+      }
       const spec = renderUiSpec(part);
       if (spec === null) {
         return null;
@@ -263,12 +267,11 @@ function QuestionRequest({
   /** The question. */
   readonly inputRequest: Interaction;
   /** The submitted answer, once there is one. */
-  readonly inputResponse?: AgentInputResponse;
+  readonly inputResponse?: Answer;
   /** Submits the answer. */
   readonly onInputResponses: OnInputResponses;
 }) {
-  const [submittedResponse, setSubmittedResponse] =
-    useState<AgentInputResponse>();
+  const [submittedResponse, setSubmittedResponse] = useState<Answer>();
   const options = inputRequest.request.options ?? [];
   const acceptsFreeform =
     inputRequest.request.allowFreeform === true || options.length === 0;
@@ -294,7 +297,7 @@ function QuestionRequest({
     }
 
     const option = options.find(({ id }) => id === answer);
-    const response: AgentInputResponse =
+    const response: Answer =
       option === undefined
         ? { interactionId: inputRequest.interactionId, text: answer.trim() }
         : { interactionId: inputRequest.interactionId, optionId: option.id };
@@ -359,7 +362,7 @@ function AnsweredQuestion({
   /** The question. */
   readonly inputRequest: Interaction;
   /** The submitted answer. */
-  readonly inputResponse: AgentInputResponse;
+  readonly inputResponse: Answer;
 }) {
   const options = inputRequest.request.options ?? [];
   const answer =
@@ -482,10 +485,10 @@ function AttachmentPart({
 }
 
 /**
- * Asks the visitor to sign in to a connection, then shows the outcome.
+ * Dispatches a question, sign-in request, or approval prompt.
  *
  * @param props - The component props.
- * @returns The authorization card.
+ * @returns The interaction prompt.
  */
 function InteractionPrompt({
   canRespond,
@@ -495,8 +498,11 @@ function InteractionPrompt({
 }: {
   /** Whether an interaction remains answerable. */
   readonly canRespond: (interactionId: string) => boolean;
-  readonly interaction: Interaction | EveInteractionPart;
+  /** The interaction to render. */
+  readonly interaction: Interaction;
+  /** Submits answers to questions and approvals. */
   readonly onInputResponses: OnInputResponses;
+  /** The tool call the interaction concerns, if any. */
   readonly tool?: EveToolPart;
 }) {
   if (interaction.request.kind === "question") {
@@ -524,7 +530,12 @@ function InteractionPrompt({
   );
 }
 
-function SignInPrompt({ interaction }: { readonly interaction: Interaction }) {
+function SignInPrompt({
+  interaction,
+}: {
+  /** The sign-in interaction to render. */
+  readonly interaction: Interaction;
+}) {
   const { signIn } = interaction.request;
   const displayName = signIn?.displayName ?? signIn?.name;
   if (interaction.status === "settled") {
@@ -633,10 +644,14 @@ function settledOutcome(
   if (interaction.status === "open") {
     return undefined;
   }
-  const approved =
-    interaction.request.kind === "approval"
-      ? interaction.outcome === "accepted"
-      : undefined;
+  let approved: boolean | undefined;
+  if (interaction.request.kind === "approval") {
+    if (interaction.outcome === "accepted") {
+      approved = true;
+    } else if (interaction.outcome === "declined") {
+      approved = false;
+    }
+  }
   const selected = interaction.request.options?.find(
     ({ id }) => id === interaction.answer?.optionId
   );
@@ -823,10 +838,12 @@ function toolState(
       return "approval-requested";
     }
     case "blocked":
-    case "cancelled":
     case "requested":
     case "running": {
       return "input-available";
+    }
+    case "cancelled": {
+      return "output-error";
     }
     default: {
       return "input-available";
