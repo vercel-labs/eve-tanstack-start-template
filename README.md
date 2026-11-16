@@ -48,7 +48,7 @@ Until you set `EVE_ACCESS_PASSWORD`, the sign-in page asks you to set it. To rep
 
 ## Local development
 
-Use Node.js 24 and pnpm. Install the [Vercel CLI](https://vercel.com/docs/cli), then clone your repository and run:
+Use Node.js 24 and pnpm. Install [Vercel CLI](https://vercel.com/docs/cli) 65.14.0 or later, which builds the agent that `vercel.ts` adds with `withEve`, then clone your repository and run:
 
 ```sh
 pnpm install

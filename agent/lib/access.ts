@@ -12,7 +12,8 @@
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 
 import { UnauthenticatedError, verifyJwtHmac } from "eve/channels/auth";
-import type { AuthFn, VerifyJwtHmacConfig } from "eve/channels/auth";
+import type { VerifyJwtHmacConfig } from "eve/channels/auth";
+import type { EveAuthFn } from "eve/channels/eve";
 import type { SessionAuthContext } from "eve/context";
 
 /** Name of the httpOnly cookie that holds the access token. */
@@ -189,10 +190,10 @@ function readCookie(header: string | null, name: string): string | undefined {
  * Route auth for the web chat's access cookie. Place it after `localDev()` and
  * before `placeholderAuth()`.
  *
- * @returns An `AuthFn` that accepts same-origin requests with a valid access
+ * @returns An `EveAuthFn` that accepts same-origin requests with a valid access
  * cookie, and skips (returns `null`) when no password is configured so
  * `placeholderAuth()` can report that instead.
- * @throws {@link UnauthenticatedError} From the returned `AuthFn`, with code
+ * @throws {@link UnauthenticatedError} From the returned `EveAuthFn`, with code
  * `access_required`, when a password is set but the cookie is missing, invalid,
  * or sent cross-site. The chat turns this 401 into a sign-in redirect.
  *
@@ -201,7 +202,7 @@ function readCookie(header: string | null, name: string): string | undefined {
  * eveChannel({ auth: [vercelOidc(), localDev(), accessCookieAuth(), placeholderAuth()] });
  * ```
  */
-export function accessCookieAuth(): AuthFn {
+export function accessCookieAuth(): EveAuthFn {
   return async (request) => {
     if (!isAccessConfigured()) {
       return null;

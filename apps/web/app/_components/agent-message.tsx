@@ -1,11 +1,10 @@
 import type { Spec } from "@json-render/react";
+import { APPROVE_OPTION_ID, DENY_OPTION_ID, signInEnding } from "eve/events";
 import type {
-  ConversationInput,
-  EveAuthorizationPart,
-  EveDynamicToolPart,
   EveMessage,
-  EveMessageInputRequest,
   EveMessagePart,
+  EveToolPart,
+  Interaction,
 } from "eve/react";
 import {
   CheckCircleIcon,
@@ -60,28 +59,18 @@ import { cn } from "@/lib/utils";
 
 import { GeneratedUi, uiSpecSchema } from "./ui-registry";
 
-/** A visitor's answer to a question or approval request. */
-export interface AgentInputResponse {
-  /** The chosen option, for a multiple-choice request. */
+/** A visitor's answer to a question or approval. */
+export interface AgentAnswer {
+  /** The interaction being answered. */
+  readonly interactionId: string;
+  /** The chosen option, for a multiple-choice interaction. */
   readonly optionId?: string;
-  /** The request being answered. */
-  readonly requestId: string;
-  /** The typed answer, for a free-form request. */
+  /** The typed answer, for a free-form interaction. */
   readonly text?: string;
 }
 
 type EveFilePart = Extract<EveMessagePart, { type: "file" }>;
-type AuthorizationOutcome = NonNullable<EveAuthorizationPart["outcome"]>;
-type OnInputResponses = (
-  responses: readonly AgentInputResponse[]
-) => void | Promise<void>;
-
-const AUTHORIZATION_OUTCOME_LABEL: Record<AuthorizationOutcome, string> = {
-  authorized: "Connected",
-  declined: "Declined",
-  failed: "Failed",
-  "timed-out": "Timed out",
-};
+type OnAnswers = (answers: readonly AgentAnswer[]) => void | Promise<void>;
 
 /**
  * Renders one chat message and each of its parts.
@@ -93,19 +82,19 @@ export function AgentMessage({
   canRespond,
   isStreaming,
   message,
-  onInputResponses,
+  onAnswers,
   questionsFor,
 }: {
-  /** Whether the request with this ID still accepts an answer. */
-  readonly canRespond: (requestId: string) => boolean;
+  /** Whether the interaction with this ID still accepts an answer. */
+  readonly canRespond: (interactionId: string) => boolean;
   /** Whether this message is the one currently streaming. */
   readonly isStreaming: boolean;
   /** The message to render. */
   readonly message: EveMessage;
   /** Submits answers to questions and approvals. */
-  readonly onInputResponses: OnInputResponses;
+  readonly onAnswers: OnAnswers;
   /** Returns every question the tool call with this ID asked. */
-  readonly questionsFor: (callId: string) => readonly ConversationInput[];
+  readonly questionsFor: (callId: string) => readonly Interaction[];
 }) {
   const lastTextIndex = message.parts.findLastIndex(
     (part) => part.type === "text"
@@ -127,7 +116,7 @@ export function AgentMessage({
             <AgentMessagePart
               canRespond={canRespond}
               key={partKey(part, index)}
-              onInputResponses={onInputResponses}
+              onAnswers={onAnswers}
               part={part}
               questionsFor={questionsFor}
               showCaret={
@@ -144,34 +133,31 @@ export function AgentMessage({
 }
 
 /**
- * Renders one message part: text, reasoning, an attachment, an authorization
- * prompt, a tool call, or the questions a tool call asked.
+ * Renders one message part: text, reasoning, an attachment, a sign-in or
+ * other request for input, a tool call, or the questions a tool call asked.
  *
  * @param props - The component props.
  * @returns The rendered part, or `null` for parts with nothing to show.
  */
 function AgentMessagePart({
   canRespond,
-  onInputResponses,
+  onAnswers,
   part,
   questionsFor,
   showCaret,
 }: {
-  /** Whether the request with this ID still accepts an answer. */
-  readonly canRespond: (requestId: string) => boolean;
+  /** Whether the interaction with this ID still accepts an answer. */
+  readonly canRespond: (interactionId: string) => boolean;
   /** Submits answers to questions and approvals. */
-  readonly onInputResponses: OnInputResponses;
+  readonly onAnswers: OnAnswers;
   /** The part to render. */
   readonly part: EveMessagePart;
   /** Returns every question the tool call with this ID asked. */
-  readonly questionsFor: (callId: string) => readonly ConversationInput[];
+  readonly questionsFor: (callId: string) => readonly Interaction[];
   /** Whether to show the streaming caret after this text part. */
   readonly showCaret: boolean;
 }) {
   switch (part.type) {
-    case "step-start": {
-      return null;
-    }
     case "text": {
       return (
         <MessageResponse caret="block" isAnimating={showCaret}>
@@ -190,12 +176,20 @@ function AgentMessagePart({
     case "file": {
       return <AttachmentPart part={part} />;
     }
-    case "authorization": {
-      return <AuthorizationPrompt part={part} />;
+    case "interaction": {
+      return (
+        <InteractionPrompt
+          canRespond={canRespond}
+          interaction={part}
+          onAnswers={onAnswers}
+        />
+      );
     }
-    case "dynamic-tool": {
-      const questions = questionsFor(part.toolCallId);
-      const inputRequest = part.toolMetadata?.eve?.inputRequest;
+    case "tool": {
+      if (part.kind === "control") {
+        return null;
+      }
+      const questions = questionsFor(part.callId);
       const spec = renderUiSpec(part);
       if (spec === null) {
         return null;
@@ -206,13 +200,16 @@ function AgentMessagePart({
       if (questions.length > 0) {
         return (
           <div className="space-y-4">
-            {questions.map(({ request, response }) => (
+            {questions.map((question) => (
               <QuestionRequest
-                canRespond={canRespond(request.requestId)}
-                inputRequest={request}
-                inputResponse={response}
-                key={request.requestId}
-                onInputResponses={onInputResponses}
+                canRespond={canRespond(question.interactionId)}
+                interaction={
+                  part.interaction?.interactionId === question.interactionId
+                    ? part.interaction
+                    : question
+                }
+                key={question.interactionId}
+                onAnswers={onAnswers}
               />
             ))}
           </div>
@@ -223,31 +220,35 @@ function AgentMessagePart({
         <>
           <Tool>
             <ToolHeader
-              state={part.state}
-              title={part.toolMetadata?.eve?.label ?? part.toolName}
-              toolName={part.toolName}
+              state={toolHeaderState(part.state)}
+              title={part.label}
+              toolName={part.name}
               type="dynamic-tool"
             />
             <ToolContent>
-              {part.toolName === "bash" ? (
+              {part.name === "bash" ? (
                 <BashToolContent
-                  errorText={part.errorText}
+                  errorText={part.error?.message}
                   input={part.input}
                   output={part.output}
                 />
               ) : (
                 <>
                   <ToolInput input={part.input} />
-                  <ToolOutput errorText={part.errorText} output={part.output} />
+                  <ToolOutput
+                    errorText={part.error?.message}
+                    output={part.output}
+                  />
                 </>
               )}
             </ToolContent>
           </Tool>
-          {inputRequest === undefined ? null : (
-            <InputRequestActions
+          {part.interaction === undefined ? null : (
+            <InteractionPrompt
               canRespond={canRespond}
+              interaction={part.interaction}
+              onAnswers={onAnswers}
               part={part}
-              onInputResponses={onInputResponses}
             />
           )}
         </>
@@ -260,17 +261,60 @@ function AgentMessagePart({
 }
 
 /**
+ * Maps a tool call's state to the status the shared tool header shows.
+ *
+ * @param state - The call's state.
+ * @returns The matching tool header state.
+ */
+function toolHeaderState(
+  state: EveToolPart["state"]
+):
+  | "approval-requested"
+  | "input-available"
+  | "input-streaming"
+  | "output-available"
+  | "output-denied"
+  | "output-error" {
+  switch (state) {
+    case "approval": {
+      return "approval-requested";
+    }
+    case "blocked":
+    case "running": {
+      return "input-available";
+    }
+    case "cancelled":
+    case "failed": {
+      return "output-error";
+    }
+    case "completed": {
+      return "output-available";
+    }
+    case "rejected": {
+      return "output-denied";
+    }
+    case "requested":
+    case "streaming": {
+      return "input-streaming";
+    }
+    default: {
+      return "input-available";
+    }
+  }
+}
+
+/**
  * Resolves what a tool part shows as generated UI.
  *
  * @param part - The tool call part.
  * @returns The spec to render, `null` to hide a rejected `render_ui` call, or
  * `undefined` for other tools and for input that is still streaming in.
  */
-function renderUiSpec(part: EveDynamicToolPart): Spec | null | undefined {
-  if (part.toolName !== "render_ui") {
+function renderUiSpec(part: EveToolPart): Spec | null | undefined {
+  if (part.name !== "render_ui") {
     return undefined;
   }
-  if (part.state === "output-error") {
+  if (part.state === "failed") {
     return null;
   }
   const parsed = uiSpecSchema.safeParse(part.input);
@@ -286,60 +330,53 @@ function renderUiSpec(part: EveDynamicToolPart): Spec | null | undefined {
  */
 function QuestionRequest({
   canRespond,
-  inputRequest,
-  inputResponse,
-  onInputResponses,
+  interaction,
+  onAnswers,
 }: {
   /** Whether the question still accepts an answer. */
   readonly canRespond: boolean;
-  /** The question. */
-  readonly inputRequest: EveMessageInputRequest;
-  /** The submitted answer, once there is one. */
-  readonly inputResponse?: AgentInputResponse;
+  /** The question, with the submitted answer once there is one. */
+  readonly interaction: Interaction;
   /** Submits the answer. */
-  readonly onInputResponses: OnInputResponses;
+  readonly onAnswers: OnAnswers;
 }) {
-  const [submittedResponse, setSubmittedResponse] =
-    useState<AgentInputResponse>();
-  const options = inputRequest.options ?? [];
+  const [submittedAnswer, setSubmittedAnswer] = useState<AgentAnswer>();
+  const { interactionId, request } = interaction;
+  const options = request.options ?? [];
   const acceptsFreeform =
-    inputRequest.allowFreeform === true || options.length === 0;
-  const answeredResponse =
-    inputResponse ?? (canRespond ? undefined : submittedResponse);
+    request.allowFreeform === true || options.length === 0;
+  const answered =
+    interaction.answer ?? (canRespond ? undefined : submittedAnswer);
 
-  if (answeredResponse !== undefined) {
-    return (
-      <AnsweredQuestion
-        inputRequest={inputRequest}
-        inputResponse={answeredResponse}
-      />
-    );
+  if (interaction.status === "settled" && interaction.answer === undefined) {
+    return <UnansweredQuestion interaction={interaction} />;
+  }
+  if (answered !== undefined) {
+    return <AnsweredQuestion answer={answered} interaction={interaction} />;
   }
 
-  const submitResponse = (event: SubmitEvent<HTMLFormElement>) => {
+  const submitAnswer = (event: SubmitEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const answer = new FormData(event.currentTarget).get(
-      inputRequest.requestId
-    );
-    if (answer === null || answer instanceof File) {
+    const value = new FormData(event.currentTarget).get(interactionId);
+    if (value === null || value instanceof File) {
       return;
     }
 
-    const option = options.find(({ id }) => id === answer);
-    const response: AgentInputResponse =
+    const option = options.find(({ id }) => id === value);
+    const answer: AgentAnswer =
       option === undefined
-        ? { requestId: inputRequest.requestId, text: answer.trim() }
-        : { optionId: option.id, requestId: inputRequest.requestId };
-    setSubmittedResponse(response);
-    void onInputResponses([response]);
+        ? { interactionId, text: value.trim() }
+        : { interactionId, optionId: option.id };
+    setSubmittedAnswer(answer);
+    void onAnswers([answer]);
   };
 
   return (
     <div className="border-info/30 bg-info/5 w-full max-w-md rounded-md border p-3">
-      <Questionnaire className="gap-3" onSubmit={submitResponse}>
-        <QuestionnaireItem name={inputRequest.requestId} required>
+      <Questionnaire className="gap-3" onSubmit={submitAnswer}>
+        <QuestionnaireItem name={interactionId} required>
           <QuestionnaireTitle className="text-sm font-medium [&:not(:has(~[data-slot=questionnaire-description]))]:mb-3">
-            {inputRequest.prompt}
+            {request.prompt}
           </QuestionnaireTitle>
           <QuestionnaireChoices className="gap-2">
             {options.map((option) => (
@@ -385,19 +422,20 @@ function QuestionRequest({
  * @returns The collapsible answer.
  */
 function AnsweredQuestion({
-  inputRequest,
-  inputResponse,
+  answer,
+  interaction,
 }: {
-  /** The question. */
-  readonly inputRequest: EveMessageInputRequest;
   /** The submitted answer. */
-  readonly inputResponse: AgentInputResponse;
+  readonly answer: AgentAnswer;
+  /** The question. */
+  readonly interaction: Interaction;
 }) {
-  const options = inputRequest.options ?? [];
-  const answer =
-    options.find(({ id }) => id === inputResponse.optionId)?.label ??
-    inputResponse.text ??
-    inputResponse.optionId;
+  const { prompt } = interaction.request;
+  const options = interaction.request.options ?? [];
+  const label =
+    options.find(({ id }) => id === answer.optionId)?.label ??
+    answer.text ??
+    answer.optionId;
 
   return (
     <div className="w-full max-w-md rounded-md border text-sm">
@@ -409,17 +447,17 @@ function AnsweredQuestion({
           >
             <ChevronRightIcon className="size-4 shrink-0 transition-transform group-data-[state=open]:rotate-90" />
             <span className="text-foreground shrink-0 font-medium">
-              {answer}
+              {label}
             </span>
-            <span className="truncate">{inputRequest.prompt}</span>
+            <span className="truncate">{prompt}</span>
           </button>
         </CollapsibleTrigger>
         <CollapsibleContent>
           <div className="space-y-2 border-t px-3 py-2">
-            <p className="font-medium">{inputRequest.prompt}</p>
+            <p className="font-medium">{prompt}</p>
             <ul className="space-y-1">
               {options.map((option) => {
-                const isChosen = option.id === inputResponse.optionId;
+                const isChosen = option.id === answer.optionId;
                 return (
                   <li
                     className={cn(
@@ -442,16 +480,79 @@ function AnsweredQuestion({
                 );
               })}
             </ul>
-            {inputResponse.text === undefined ? null : (
-              <blockquote className="border-l-2 pl-3">
-                {inputResponse.text}
-              </blockquote>
+            {answer.text === undefined ? null : (
+              <blockquote className="border-l-2 pl-3">{answer.text}</blockquote>
             )}
           </div>
         </CollapsibleContent>
       </Collapsible>
     </div>
   );
+}
+
+/**
+ * A question that closed without an answer, such as when the visitor stopped
+ * the turn or sent a new message, with how it ended.
+ *
+ * @param props - The component props.
+ * @returns The closed question row.
+ */
+function UnansweredQuestion({
+  interaction,
+}: {
+  /** The settled question. */
+  readonly interaction: Interaction;
+}) {
+  return (
+    <div className="text-muted-foreground flex w-full max-w-md items-center gap-2 rounded-md border px-3 py-2 text-sm">
+      <XCircleIcon className="size-4 shrink-0" />
+      <span className="text-foreground shrink-0 font-medium">
+        {endingLabel(interaction.outcome)}
+      </span>
+      <span className="truncate">{interaction.request.prompt}</span>
+    </div>
+  );
+}
+
+/**
+ * Names how an interaction ended, for one that closed without an answer.
+ *
+ * @param outcome - The interaction's outcome, if eve recorded one.
+ * @returns A short label such as "Withdrawn" or "Expired".
+ */
+function endingLabel(outcome: Interaction["outcome"]): string {
+  switch (outcome) {
+    case "abandoned": {
+      return "Abandoned";
+    }
+    case "accepted": {
+      return "Accepted";
+    }
+    case "declined": {
+      return "Declined";
+    }
+    case "expired": {
+      return "Expired";
+    }
+    case "failed": {
+      return "Failed";
+    }
+    case "interrupted": {
+      return "Interrupted";
+    }
+    case "invalid": {
+      return "Invalid answer";
+    }
+    case "withdrawn": {
+      return "Withdrawn";
+    }
+    case undefined: {
+      return "Closed";
+    }
+    default: {
+      return "Closed";
+    }
+  }
 }
 
 /**
@@ -514,20 +615,69 @@ function AttachmentPart({
 }
 
 /**
+ * Shows a request for input in the card that matches its kind: a sign-in, a
+ * question, or a prompt with a button for each option.
+ *
+ * @param props - The component props.
+ * @returns The card for the interaction.
+ */
+function InteractionPrompt({
+  canRespond,
+  interaction,
+  onAnswers,
+  part,
+}: {
+  /** Whether the interaction with this ID still accepts an answer. */
+  readonly canRespond: (interactionId: string) => boolean;
+  /** The interaction to show. */
+  readonly interaction: Interaction;
+  /** Submits answers to questions and approvals. */
+  readonly onAnswers: OnAnswers;
+  /** The tool call the interaction asks about, when it belongs to one. */
+  readonly part?: EveToolPart;
+}) {
+  if (interaction.request.signIn !== undefined) {
+    return <SignInPrompt interaction={interaction} />;
+  }
+  if (interaction.request.kind === "question") {
+    return (
+      <QuestionRequest
+        canRespond={canRespond(interaction.interactionId)}
+        interaction={interaction}
+        onAnswers={onAnswers}
+      />
+    );
+  }
+  return (
+    <InteractionActions
+      canRespond={canRespond}
+      interaction={interaction}
+      onAnswers={onAnswers}
+      part={part}
+    />
+  );
+}
+
+/**
  * Asks the visitor to sign in to a connection, then shows the outcome.
  *
  * @param props - The component props.
- * @returns The authorization card.
+ * @returns The sign-in card.
  */
-function AuthorizationPrompt({
-  part,
+function SignInPrompt({
+  interaction,
 }: {
-  /** The authorization part. */
-  readonly part: EveAuthorizationPart;
+  /** The sign-in interaction. */
+  readonly interaction: Interaction;
 }) {
-  if (part.state === "completed") {
-    const authorized = part.outcome === "authorized";
+  const { request } = interaction;
+  const { signIn } = request;
+  const displayName = signIn?.displayName ?? signIn?.name ?? "the service";
+
+  if (interaction.status === "settled") {
+    const authorized = interaction.outcome === "accepted";
     const Icon = authorized ? CheckCircleIcon : XCircleIcon;
+    const ending = signInEnding(interaction.outcome ?? "withdrawn");
     return (
       <div className="text-muted-foreground flex w-full max-w-md items-center gap-2 rounded-md border px-3 py-2 text-sm">
         <Icon
@@ -537,28 +687,28 @@ function AuthorizationPrompt({
           )}
         />
         <span className="text-foreground font-medium">
-          {AUTHORIZATION_OUTCOME_LABEL[part.outcome]}
+          {`${ending.charAt(0).toUpperCase()}${ending.slice(1)}`}
         </span>
         <span className="truncate">
-          {part.reason === undefined
-            ? part.displayName
-            : `${part.displayName} (${part.reason})`}
+          {interaction.reason === undefined
+            ? displayName
+            : `${displayName} (${interaction.reason})`}
         </span>
       </div>
     );
   }
 
-  const instructions = part.authorization?.instructions;
-  const userCode = part.authorization?.userCode;
-  const signInUrl = part.authorization?.url;
+  const instructions = signIn?.instructions;
+  const userCode = signIn?.userCode;
+  const signInUrl = signIn?.url;
 
   return (
     <div className="border-info/30 bg-info/5 w-full max-w-md space-y-3 rounded-md border p-3">
       <div className="space-y-1">
-        <p className="text-sm font-medium">Connect {part.displayName}</p>
-        <p className="text-muted-foreground text-sm">{part.description}</p>
+        <p className="text-sm font-medium">Connect {displayName}</p>
+        <p className="text-muted-foreground text-sm">{request.prompt}</p>
         {instructions === undefined ||
-        instructions === part.description ? null : (
+        instructions === request.prompt ? null : (
           <p className="text-muted-foreground text-sm">{instructions}</p>
         )}
       </div>
@@ -572,7 +722,7 @@ function AuthorizationPrompt({
         <Button asChild size="sm">
           <a href={signInUrl} rel="noreferrer" target="_blank">
             <ExternalLinkIcon className="size-4" />
-            Sign in with {part.displayName}
+            Sign in with {displayName}
           </a>
         </Button>
       )}
@@ -625,41 +775,74 @@ const inputSummarySchema = z
   );
 
 /**
- * Resolves a settled request to the text shown in place of its buttons.
+ * Resolves an answered interaction to the text shown in place of its buttons.
+ * An approval counts as approved only when a person accepted it. For other
+ * requests, such as the budget prompt, the deny option or a declined outcome
+ * counts as not approved, and one that closed without an answer shows how it
+ * ended.
  *
- * @param part - The tool call part.
- * @param inputRequest - The request.
- * @param inputResponse - The visitor's answer, if recorded.
- * @returns The outcome, or `undefined` while the request is open.
+ * @param interaction - The interaction, with the visitor's answer if recorded.
+ * @returns The outcome, or `undefined` while the interaction awaits an answer.
  */
 function settledOutcome(
-  part: EveDynamicToolPart,
-  inputRequest: EveMessageInputRequest,
-  inputResponse: AgentInputResponse | undefined
+  interaction: Interaction
 ):
   | { readonly approved: boolean | undefined; readonly label: string }
   | undefined {
-  const options = inputRequest.options ?? [];
-  if (inputRequest.kind === "tool-approval") {
-    const approved =
-      part.approval?.approved ??
-      (inputResponse?.optionId === undefined
-        ? undefined
-        : inputResponse.optionId === "approve");
+  const { answer, request } = interaction;
+  if (request.kind === "approval") {
+    let approved: boolean | undefined;
+    if (interaction.status === "settled") {
+      approved = interaction.outcome === "accepted";
+    } else if (answer?.optionId !== undefined) {
+      approved = answer.optionId === APPROVE_OPTION_ID;
+    }
     if (approved === undefined) {
       return undefined;
     }
     return { approved, label: approved ? "Approved" : "Cancelled" };
   }
-  if (inputResponse === undefined) {
-    return undefined;
+  if (answer === undefined) {
+    return interaction.status === "settled"
+      ? {
+          approved: interaction.outcome === "accepted",
+          label: endingLabel(interaction.outcome),
+        }
+      : undefined;
   }
-  const selected = options.find(({ id }) => id === inputResponse.optionId);
+  const selected = request.options?.find(({ id }) => id === answer.optionId);
   return {
-    approved: undefined,
-    label:
-      selected?.label ?? inputResponse.text ?? inputResponse.optionId ?? "",
+    approved: answeredDecision(interaction, answer),
+    label: selected?.label ?? answer.text ?? answer.optionId ?? "",
   };
+}
+
+/**
+ * Decides whether an answered request, such as the budget prompt, reads as
+ * approved. Once settled, an approve or deny answer follows the outcome.
+ *
+ * @param interaction - The interaction.
+ * @param answer - The visitor's answer.
+ * @returns `true` or `false` for an approve or deny decision, or `undefined`
+ * for another kind of answer.
+ */
+function answeredDecision(
+  interaction: Interaction,
+  answer: AgentAnswer
+): boolean | undefined {
+  const isSettled = interaction.status === "settled";
+  const decides =
+    answer.optionId === APPROVE_OPTION_ID || answer.optionId === DENY_OPTION_ID;
+  if (isSettled && decides) {
+    return interaction.outcome === "accepted";
+  }
+  if (
+    answer.optionId === DENY_OPTION_ID ||
+    (isSettled && interaction.outcome === "declined")
+  ) {
+    return false;
+  }
+  return answer.optionId === APPROVE_OPTION_ID ? true : undefined;
 }
 
 /**
@@ -667,29 +850,30 @@ function settledOutcome(
  * shows the decision once made.
  *
  * @param props - The component props.
- * @returns The approval card, or `null` when the tool call asks for nothing.
+ * @returns The approval card.
  */
-function InputRequestActions({
+function InteractionActions({
   canRespond,
-  onInputResponses,
+  interaction,
+  onAnswers,
   part,
 }: {
-  /** Whether the request with this ID still accepts an answer. */
-  readonly canRespond: (requestId: string) => boolean;
+  /** Whether the interaction with this ID still accepts an answer. */
+  readonly canRespond: (interactionId: string) => boolean;
+  /** The approval or other request with options. */
+  readonly interaction: Interaction;
   /** Submits the chosen option. */
-  readonly onInputResponses: OnInputResponses;
-  /** The tool call part. */
-  readonly part: EveDynamicToolPart;
+  readonly onAnswers: OnAnswers;
+  /** The tool call the interaction asks about, when it belongs to one. */
+  readonly part?: EveToolPart;
 }) {
-  const eve = part.toolMetadata?.eve;
-  const inputRequest = eve?.inputRequest;
-  if (inputRequest === undefined) {
-    return null;
-  }
-
-  const isApproval = inputRequest.kind === "tool-approval";
-  const outcome = settledOutcome(part, inputRequest, eve?.inputResponse);
-  const summary = inputSummarySchema.safeParse(part.input);
+  const { interactionId, request } = interaction;
+  const isApproval = request.kind === "approval";
+  const toolLabel = part?.label ?? interaction.call?.name;
+  const outcome = settledOutcome(interaction);
+  const summary = inputSummarySchema.safeParse(
+    part?.input ?? interaction.call?.input
+  );
   const details = isApproval && summary.success ? summary.data : [];
 
   if (outcome !== undefined) {
@@ -703,9 +887,9 @@ function InputRequestActions({
           )}
         />
         <span className="text-foreground font-medium">{outcome.label}</span>
-        {isApproval ? (
-          <span className="truncate">{eve?.label ?? part.toolName}</span>
-        ) : null}
+        <span className="truncate">
+          {isApproval ? toolLabel : (request.title ?? request.prompt)}
+        </span>
       </div>
     );
   }
@@ -714,7 +898,7 @@ function InputRequestActions({
     <div className="border-warning/30 bg-warning/5 w-full max-w-md space-y-3 rounded-md border p-3">
       <div className="space-y-1">
         <p className="text-sm font-medium">
-          {isApproval ? (eve?.label ?? part.toolName) : inputRequest.prompt}
+          {isApproval ? (toolLabel ?? request.prompt) : request.prompt}
         </p>
         {isApproval ? (
           <p className="text-muted-foreground text-sm">
@@ -738,17 +922,12 @@ function InputRequestActions({
         </dl>
       ) : null}
       <div className="flex flex-wrap gap-2">
-        {inputRequest.options?.map((option, index) => (
+        {request.options?.map((option, index) => (
           <Button
-            disabled={!canRespond(inputRequest.requestId)}
+            disabled={!canRespond(interactionId)}
             key={option.id}
             onClick={() => {
-              void onInputResponses([
-                {
-                  optionId: option.id,
-                  requestId: inputRequest.requestId,
-                },
-              ]);
+              void onAnswers([{ interactionId, optionId: option.id }]);
             }}
             size="sm"
             type="button"
@@ -788,20 +967,17 @@ function optionVariant(
  */
 function partKey(part: EveMessagePart, index: number): string {
   switch (part.type) {
-    case "authorization": {
-      return part.attemptId === undefined
-        ? `authorization:${part.turnId}:${part.stepIndex}:${part.name}`
-        : `authorization:${part.attemptId}`;
+    case "interaction": {
+      return `interaction:${part.interactionId}`;
     }
-    case "dynamic-tool": {
-      return part.toolCallId;
+    case "tool": {
+      return part.callId;
     }
     case "reasoning":
     case "text": {
       return `${part.type}:${part.id ?? index}`;
     }
-    case "file":
-    case "step-start": {
+    case "file": {
       return `${part.type}:${index}`;
     }
     default: {

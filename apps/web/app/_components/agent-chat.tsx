@@ -1,12 +1,17 @@
 import { useHotkey } from "@tanstack/react-hotkeys";
-import type { UserContent } from "ai";
 import { ClientError } from "eve/client";
+import type { MessagePart } from "eve/client";
+import {
+  activeTurn,
+  failure,
+  interaction,
+  interactions,
+  turns,
+  waiting,
+} from "eve/events";
+import type { Interaction } from "eve/events";
 import { useEveAgent } from "eve/react";
-import type {
-  ConversationInput,
-  ConversationState,
-  UseEveAgentHelpers,
-} from "eve/react";
+import type { UseEveAgentReturn } from "eve/react";
 import { AlertCircleIcon, BrainIcon, PlusIcon, SquareIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
@@ -34,12 +39,14 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
 import { AgentMessage } from "./agent-message";
-import type { AgentInputResponse } from "./agent-message";
+import type { AgentAnswer } from "./agent-message";
 
 const DEFAULT_AGENT_NAME = "eve TanStack Agent";
 const AGENT_NAME = WEB_CHAT_AGENT ?? DEFAULT_AGENT_NAME;
+const MODEL_UNAVAILABLE_MESSAGE =
+  "The model is temporarily unavailable. Please try again.";
 
-type EveAgent = UseEveAgentHelpers<ConversationState>;
+type EveAgent = UseEveAgentReturn;
 
 /** Whether to show the thinking indicator, and the empty assistant message it replaces. */
 interface PendingAssistant {
@@ -50,10 +57,22 @@ interface PendingAssistant {
 /** Display state derived from the agent on each render. */
 interface ChatView {
   readonly activeSessionId: string | undefined;
+  /**
+   * Whether there is a turn for the Stop control to cancel: one that is running
+   * or paused, or one a message the visitor just sent is about to start. A sent
+   * message is detected by its optimistic `submitted` status, so this relies on
+   * `useEveAgent`'s default `optimistic: true`.
+   */
+  readonly canCancel: boolean;
+  /**
+   * Whether `Escape` stops the turn: like {@link ChatView.canCancel}, but not
+   * while the turn is paused for an answer, so `Escape` in a text field doesn't
+   * withdraw the request.
+   */
+  readonly canStop: boolean;
   readonly errorMessage: string | undefined;
   /** The empty assistant message hidden while the thinking indicator stands in for it. */
   readonly hiddenMessageId: string | undefined;
-  readonly isBusy: boolean;
   readonly isResuming: boolean;
   readonly showConversationLayout: boolean;
   readonly showPendingThinking: boolean;
@@ -116,8 +135,8 @@ export function AgentChat({
   };
 
   useChatHotkeys({
+    canStop: view.canStop,
     composerRef,
-    isBusy: view.isBusy,
     onCancel: () => {
       void requestCancellation();
     },
@@ -131,10 +150,13 @@ export function AgentChat({
 
     setHasInputText(false);
     setActionError(undefined);
-    const options = view.isBusy ? { turnPolicy: "steer" as const } : undefined;
+    const options =
+      activeTurn(agent.view) === undefined
+        ? undefined
+        : { turnPolicy: "steer" as const };
     await (message.files.length === 0
       ? agent.send(text, options)
-      : agent.send(toUserContent(text, message.files), options));
+      : agent.send(toMessageParts(text, message.files), options));
   };
 
   const composer = (
@@ -148,8 +170,8 @@ export function AgentChat({
         placeholder="Send a message…"
       />
       <ComposerAction
+        canCancel={view.canCancel}
         hasInputText={hasInputText}
-        isBusy={view.isBusy}
         isResuming={view.isResuming}
         onCancel={() => {
           void requestCancellation();
@@ -166,10 +188,10 @@ export function AgentChat({
           <ChatConversation
             agent={agent}
             isInitialSession={sessionId !== undefined}
-            onInputResponses={async (inputResponses) => {
+            onAnswers={async (answers) => {
               setActionError(undefined);
               try {
-                await agent.respond(inputResponses);
+                await agent.respond(answers);
               } catch (error) {
                 setActionError(
                   error instanceof Error
@@ -227,20 +249,24 @@ export function AgentChat({
 
 /**
  * Registers the chat's keyboard shortcuts: `/` or `Mod+K` focuses the composer,
- * `Escape` stops a streaming reply, and `Mod+Shift+O` starts a new chat.
+ * `Escape` stops a running turn, and `Mod+Shift+O` starts a new chat.
  *
  * @param options - The composer and the active turn's state.
  */
 function useChatHotkeys({
+  canStop,
   composerRef,
-  isBusy,
   onCancel,
 }: {
+  /**
+   * Whether a turn is running, or a message just sent is about to start one,
+   * which enables `Escape`. A turn paused for an answer is left alone, so
+   * `Escape` in a text field doesn't withdraw it.
+   */
+  readonly canStop: boolean;
   /** The composer's textarea. */
   readonly composerRef: RefObject<HTMLTextAreaElement | null>;
-  /** Whether a reply is streaming, which enables `Escape`. */
-  readonly isBusy: boolean;
-  /** Stops the streaming reply. */
+  /** Stops the turn. */
   readonly onCancel: () => void;
 }) {
   const focusComposer = () => {
@@ -248,7 +274,7 @@ function useChatHotkeys({
   };
   useHotkey("/", focusComposer);
   useHotkey("Mod+K", focusComposer);
-  useHotkey("Escape", onCancel, { enabled: isBusy });
+  useHotkey("Escape", onCancel, { enabled: canStop });
   useHotkey("Mod+Shift+O", () => {
     window.location.assign("/s");
   });
@@ -263,8 +289,7 @@ function useChatHotkeys({
  * @param error - The agent client's current error.
  */
 function useSignInRedirect(error: Error | undefined) {
-  const isUnauthenticated =
-    error instanceof ClientError && error.status === 401;
+  const isUnauthenticated = ClientError.is(error) && error.status === 401;
   useEffect(() => {
     let isCurrent = true;
     const redirectIfLocked = async () => {
@@ -320,20 +345,33 @@ function getChatView(
     readonly sessionless: boolean;
   }
 ): ChatView {
-  const isBusy = agent.status === "submitted" || agent.status === "streaming";
+  const isBusy = agent.status === "busy";
   const isResuming = agent.status === "resuming";
   const pending = getPendingAssistant(agent, isBusy);
   const turnFailure =
-    isBusy || isResuming ? undefined : getLatestTurnFailure(agent.events);
-  const errorMessage = actionError ?? agent.error?.message ?? turnFailure;
+    isBusy || isResuming ? undefined : getLatestTurnFailure(agent.view);
+  const agentError =
+    agent.error?.name === "MODEL_CALL_FAILED"
+      ? MODEL_UNAVAILABLE_MESSAGE
+      : agent.error?.message;
+  const errorMessage = actionError ?? agentError ?? turnFailure;
   const hasConversationContent =
-    sessionless || agent.data.messages.length > 0 || errorMessage !== undefined;
+    sessionless || agent.messages.length > 0 || errorMessage !== undefined;
+  const turn = activeTurn(agent.view);
+  const isPaused =
+    turn !== undefined &&
+    waiting(agent.view, turn.turnId)?.on === "interaction";
+  const isSending = agent.messages.some(
+    (message) =>
+      message.role === "user" && message.metadata?.status === "submitted"
+  );
 
   return {
     activeSessionId: sessionId ?? agent.session?.sessionId,
+    canCancel: !isResuming && (turn !== undefined || isSending),
+    canStop: !isResuming && ((turn !== undefined && !isPaused) || isSending),
     errorMessage,
     hiddenMessageId: pending.hiddenMessageId,
-    isBusy,
     isResuming,
     showConversationLayout: isResuming || hasConversationContent,
     showPendingThinking: pending.showThinking,
@@ -342,17 +380,17 @@ function getChatView(
 
 /**
  * Decides whether to show the thinking indicator, and which empty assistant
- * message (one with only `step-start` parts) it replaces.
+ * message (one with no parts it renders) it replaces.
  *
  * @param agent - The `useEveAgent` result.
- * @param isBusy - Whether a turn is submitted or streaming.
+ * @param isBusy - Whether a turn is running.
  * @returns Whether to show the indicator, and the message ID it hides.
  */
 function getPendingAssistant(
   agent: EveAgent,
   isBusy: boolean
 ): PendingAssistant {
-  const lastMessage = agent.data.messages.at(-1);
+  const lastMessage = agent.messages.at(-1);
   if (!isBusy) {
     return { hiddenMessageId: undefined, showThinking: false };
   }
@@ -360,11 +398,11 @@ function getPendingAssistant(
     return { hiddenMessageId: undefined, showThinking: true };
   }
   const isEmptyShell = lastMessage.parts.every(
-    (part) => part.type === "step-start"
+    (part) => part.type === "tool" && part.kind === "control"
   );
   return {
     hiddenMessageId: isEmptyShell ? lastMessage.id : undefined,
-    showThinking: agent.status === "submitted" || isEmptyShell,
+    showThinking: isEmptyShell,
   };
 }
 
@@ -375,11 +413,11 @@ function getPendingAssistant(
  * @param files - The attached files.
  * @returns The message content parts.
  */
-function toUserContent(
+function toMessageParts(
   text: string,
   files: PromptInputMessage["files"]
-): UserContent {
-  const parts: UserContent = [];
+): MessagePart[] {
+  const parts: MessagePart[] = [];
   if (text.length > 0) {
     parts.push({ text, type: "text" });
   }
@@ -403,7 +441,7 @@ function toUserContent(
 function ChatConversation({
   agent,
   isInitialSession,
-  onInputResponses,
+  onAnswers,
   view,
 }: {
   /** The `useEveAgent` result. */
@@ -411,20 +449,18 @@ function ChatConversation({
   /** Whether the page opened on an existing session. */
   readonly isInitialSession: boolean;
   /** Submits answers to questions and approvals. */
-  readonly onInputResponses: (
-    responses: readonly AgentInputResponse[]
-  ) => Promise<void>;
+  readonly onAnswers: (answers: readonly AgentAnswer[]) => Promise<void>;
   /** The derived {@link ChatView}. */
   readonly view: ChatView;
 }) {
-  const { messages } = agent.data;
-  const canRespond = (requestId: string) =>
-    !view.isResuming && agent.data.inputs[requestId]?.status === "open";
-  const questionsFor = (callId: string): ConversationInput[] =>
-    Object.values(agent.data.inputs).filter(
-      (input) =>
-        input.request.kind === "question" &&
-        input.request.action.callId === callId
+  const { messages } = agent;
+  const canRespond = (interactionId: string) =>
+    !view.isResuming &&
+    interaction(agent.view, interactionId)?.status === "open";
+  const questionsFor = (callId: string): Interaction[] =>
+    interactions(agent.view).filter(
+      (question) =>
+        question.request.kind === "question" && question.call?.callId === callId
     );
   const scrollKey =
     messages.length > 0 && view.activeSessionId !== undefined
@@ -445,12 +481,11 @@ function ChatConversation({
             <AgentMessage
               canRespond={canRespond}
               isStreaming={
-                agent.status === "streaming" &&
-                message.id === messages.at(-1)?.id
+                agent.status === "busy" && message.id === messages.at(-1)?.id
               }
               key={message.id}
               message={message}
-              onInputResponses={onInputResponses}
+              onAnswers={onAnswers}
               questionsFor={questionsFor}
             />
           )
@@ -466,30 +501,30 @@ function ChatConversation({
 }
 
 /**
- * The composer's action button: send, or stop while a turn runs and the composer is empty.
+ * The composer's action button: send, or stop while a turn is open and the composer is empty.
  *
  * @param props - The component props.
  * @returns The send or stop button.
  */
 function ComposerAction({
+  canCancel,
   hasInputText,
-  isBusy,
   isResuming,
   onCancel,
 }: {
+  /** Whether a running or paused turn exists to cancel. */
+  readonly canCancel: boolean;
   /** Whether the textarea has text. */
   readonly hasInputText: boolean;
-  /** Whether a turn is running. */
-  readonly isBusy: boolean;
   /** Whether the session is still catching up. */
   readonly isResuming: boolean;
-  /** Cancels the running turn. */
+  /** Cancels the running or paused turn. */
   readonly onCancel: () => void;
 }) {
   const attachments = usePromptInputAttachments();
   const canSubmit = hasInputText || attachments.files.length > 0;
 
-  if (!isBusy || canSubmit) {
+  if (!canCancel || canSubmit) {
     return <PromptInputSubmit disabled={isResuming || !canSubmit} />;
   }
 
@@ -597,29 +632,17 @@ function PendingThinking() {
 }
 
 /**
- * Finds the latest turn failure, ignoring failures a later turn or message superseded.
+ * Finds why the latest turn failed, so a failure a later turn superseded isn't shown.
  *
- * @param events - The agent's event log.
+ * @param view - The agent's session view.
  * @returns A user-facing failure message, or `undefined` when the latest turn did not fail.
  */
-function getLatestTurnFailure(events: EveAgent["events"]): string | undefined {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-
-    if (event.type === "turn.failed") {
-      return event.data.code === "MODEL_CALL_FAILED"
-        ? "The model is temporarily unavailable. Please try again."
-        : event.data.message;
-    }
-
-    if (
-      event.type === "turn.completed" ||
-      event.type === "turn.cancelled" ||
-      event.type === "message.received"
-    ) {
-      return undefined;
-    }
+function getLatestTurnFailure(view: EveAgent["view"]): string | undefined {
+  const turnFailure = failure(view, turns(view).at(-1)?.turnId);
+  if (turnFailure === undefined) {
+    return undefined;
   }
-
-  return undefined;
+  return turnFailure.code === "MODEL_CALL_FAILED"
+    ? MODEL_UNAVAILABLE_MESSAGE
+    : turnFailure.message;
 }
