@@ -7,6 +7,7 @@ import {
   interaction,
   interactions,
   turns,
+  waiting,
 } from "eve/events";
 import type { Interaction } from "eve/events";
 import { useEveAgent } from "eve/react";
@@ -58,14 +59,20 @@ interface ChatView {
   readonly activeSessionId: string | undefined;
   /**
    * Whether there is a turn for the Stop control to cancel: one that is running
-   * or paused, or one a message the visitor just sent is about to start.
+   * or paused, or one a message the visitor just sent is about to start. A sent
+   * message is detected by its optimistic `submitted` status, so this relies on
+   * `useEveAgent`'s default `optimistic: true`.
    */
   readonly canCancel: boolean;
+  /**
+   * Whether `Escape` stops the turn: like {@link ChatView.canCancel}, but not
+   * while the turn is paused for an answer, so `Escape` in a text field doesn't
+   * withdraw the request.
+   */
+  readonly canStop: boolean;
   readonly errorMessage: string | undefined;
   /** The empty assistant message hidden while the thinking indicator stands in for it. */
   readonly hiddenMessageId: string | undefined;
-  /** Whether the agent is working, rather than idle or waiting on a person. */
-  readonly isBusy: boolean;
   readonly isResuming: boolean;
   readonly showConversationLayout: boolean;
   readonly showPendingThinking: boolean;
@@ -128,7 +135,7 @@ export function AgentChat({
   };
 
   useChatHotkeys({
-    canStop: view.isBusy && view.canCancel,
+    canStop: view.canStop,
     composerRef,
     onCancel: () => {
       void requestCancellation();
@@ -143,9 +150,10 @@ export function AgentChat({
 
     setHasInputText(false);
     setActionError(undefined);
-    const options = view.canCancel
-      ? { turnPolicy: "steer" as const }
-      : undefined;
+    const options =
+      activeTurn(agent.view) === undefined
+        ? undefined
+        : { turnPolicy: "steer" as const };
     await (message.files.length === 0
       ? agent.send(text, options)
       : agent.send(toMessageParts(text, message.files), options));
@@ -251,8 +259,9 @@ function useChatHotkeys({
   onCancel,
 }: {
   /**
-   * Whether a turn is running, which enables `Escape`. A turn paused for an
-   * answer is left alone, so `Escape` in a text field doesn't withdraw it.
+   * Whether a turn is running, or a message just sent is about to start one,
+   * which enables `Escape`. A turn paused for an answer is left alone, so
+   * `Escape` in a text field doesn't withdraw it.
    */
   readonly canStop: boolean;
   /** The composer's textarea. */
@@ -348,13 +357,21 @@ function getChatView(
   const errorMessage = actionError ?? agentError ?? turnFailure;
   const hasConversationContent =
     sessionless || agent.messages.length > 0 || errorMessage !== undefined;
+  const turn = activeTurn(agent.view);
+  const isPaused =
+    turn !== undefined &&
+    waiting(agent.view, turn.turnId)?.on === "interaction";
+  const isSending = agent.messages.some(
+    (message) =>
+      message.role === "user" && message.metadata?.status === "submitted"
+  );
 
   return {
     activeSessionId: sessionId ?? agent.session?.sessionId,
-    canCancel: !isResuming && (isBusy || activeTurn(agent.view) !== undefined),
+    canCancel: !isResuming && (turn !== undefined || isSending),
+    canStop: !isResuming && ((turn !== undefined && !isPaused) || isSending),
     errorMessage,
     hiddenMessageId: pending.hiddenMessageId,
-    isBusy,
     isResuming,
     showConversationLayout: isResuming || hasConversationContent,
     showPendingThinking: pending.showThinking,
