@@ -46,7 +46,7 @@ When you add or remove a tool, update the Tools section to match. The Response s
 
 ### Model and session limits
 
-Change `model` in [agent/agent.ts](agent/agent.ts) to use another [AI Gateway model](https://vercel.com/ai-gateway/models). The template uses `openai/gpt-6.1-sol-fast` and limits each conversation to `300_000` input tokens through `maxInputTokensPerSession`. See [eve's agent configuration](https://eve.dev/docs/agent-config) for output and cost limits.
+Change `model` in [agent/agent.ts](agent/agent.ts) to use another [AI Gateway model](https://vercel.com/ai-gateway/models). The template uses `openai/gpt-6.1-sol-fast` and limits each conversation to `300_000` input tokens through `limits.sessionUsage`. See [eve's agent configuration](https://eve.dev/docs/agent-config) for output and cost limits.
 
 ## Add or remove tools
 
@@ -224,7 +224,7 @@ See [eve's Vercel Sandbox documentation](https://eve.dev/docs/sandbox/vercel) fo
 | Approval demo | Remove `agent/tools/approval_demo.ts` |
 | Questions | Remove `agent/tools/ask_question.ts` |
 | Web search and fetching | Add `agent/tools/web_search.ts` and `agent/tools/web_fetch.ts`, each exporting `disableTool()` |
-| Sandbox tools | Add `agent/tools/bash.ts`, `agent/tools/read_file.ts`, and `agent/tools/write_file.ts`, each exporting `disableTool()` |
+| Sandbox tools | Add `agent/tools/bash.ts`, `agent/tools/read_file.ts`, `agent/tools/write_file.ts`, and `agent/tools/edit_file.ts`, each exporting `disableTool()` |
 | Password | Follow [Use your own sign-in](#use-your-own-sign-in) or [Make the chat public](#make-the-chat-public) |
 
 ## Test and deploy your changes
