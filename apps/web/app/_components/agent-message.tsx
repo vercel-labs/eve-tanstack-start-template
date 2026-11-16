@@ -1,5 +1,5 @@
 import type { Spec } from "@json-render/react";
-import { APPROVE_OPTION_ID, signInEnding } from "eve/events";
+import { APPROVE_OPTION_ID, DENY_OPTION_ID, signInEnding } from "eve/events";
 import type {
   EveMessage,
   EveMessagePart,
@@ -348,6 +348,9 @@ function QuestionRequest({
   const answered =
     interaction.answer ?? (canRespond ? undefined : submittedAnswer);
 
+  if (interaction.status === "settled" && interaction.answer === undefined) {
+    return <UnansweredQuestion interaction={interaction} />;
+  }
   if (answered !== undefined) {
     return <AnsweredQuestion answer={answered} interaction={interaction} />;
   }
@@ -485,6 +488,71 @@ function AnsweredQuestion({
       </Collapsible>
     </div>
   );
+}
+
+/**
+ * A question that closed without an answer, such as when the visitor stopped
+ * the turn or sent a new message, with how it ended.
+ *
+ * @param props - The component props.
+ * @returns The closed question row.
+ */
+function UnansweredQuestion({
+  interaction,
+}: {
+  /** The settled question. */
+  readonly interaction: Interaction;
+}) {
+  return (
+    <div className="text-muted-foreground flex w-full max-w-md items-center gap-2 rounded-md border px-3 py-2 text-sm">
+      <XCircleIcon className="size-4 shrink-0" />
+      <span className="text-foreground shrink-0 font-medium">
+        {endingLabel(interaction.outcome)}
+      </span>
+      <span className="truncate">{interaction.request.prompt}</span>
+    </div>
+  );
+}
+
+/**
+ * Names how an interaction ended, for one that closed without an answer.
+ *
+ * @param outcome - The interaction's outcome, if eve recorded one.
+ * @returns A short label such as "Withdrawn" or "Expired".
+ */
+function endingLabel(outcome: Interaction["outcome"]): string {
+  switch (outcome) {
+    case "abandoned": {
+      return "Abandoned";
+    }
+    case "accepted": {
+      return "Accepted";
+    }
+    case "declined": {
+      return "Declined";
+    }
+    case "expired": {
+      return "Expired";
+    }
+    case "failed": {
+      return "Failed";
+    }
+    case "interrupted": {
+      return "Interrupted";
+    }
+    case "invalid": {
+      return "Invalid answer";
+    }
+    case "withdrawn": {
+      return "Withdrawn";
+    }
+    case undefined: {
+      return "Closed";
+    }
+    default: {
+      return "Closed";
+    }
+  }
 }
 
 /**
@@ -708,7 +776,10 @@ const inputSummarySchema = z
 
 /**
  * Resolves an answered interaction to the text shown in place of its buttons.
- * An approval counts as approved only when a person accepted it.
+ * An approval counts as approved only when a person accepted it. For other
+ * requests, such as the budget prompt, the deny option or a declined outcome
+ * counts as not approved, and one that closed without an answer shows how it
+ * ended.
  *
  * @param interaction - The interaction, with the visitor's answer if recorded.
  * @returns The outcome, or `undefined` while the interaction awaits an answer.
@@ -732,13 +803,46 @@ function settledOutcome(
     return { approved, label: approved ? "Approved" : "Cancelled" };
   }
   if (answer === undefined) {
-    return undefined;
+    return interaction.status === "settled"
+      ? {
+          approved: interaction.outcome === "accepted",
+          label: endingLabel(interaction.outcome),
+        }
+      : undefined;
   }
   const selected = request.options?.find(({ id }) => id === answer.optionId);
   return {
-    approved: undefined,
+    approved: answeredDecision(interaction, answer),
     label: selected?.label ?? answer.text ?? answer.optionId ?? "",
   };
+}
+
+/**
+ * Decides whether an answered request, such as the budget prompt, reads as
+ * approved. Once settled, an approve or deny answer follows the outcome.
+ *
+ * @param interaction - The interaction.
+ * @param answer - The visitor's answer.
+ * @returns `true` or `false` for an approve or deny decision, or `undefined`
+ * for another kind of answer.
+ */
+function answeredDecision(
+  interaction: Interaction,
+  answer: AgentAnswer
+): boolean | undefined {
+  const isSettled = interaction.status === "settled";
+  const decides =
+    answer.optionId === APPROVE_OPTION_ID || answer.optionId === DENY_OPTION_ID;
+  if (isSettled && decides) {
+    return interaction.outcome === "accepted";
+  }
+  if (
+    answer.optionId === DENY_OPTION_ID ||
+    (isSettled && interaction.outcome === "declined")
+  ) {
+    return false;
+  }
+  return answer.optionId === APPROVE_OPTION_ID ? true : undefined;
 }
 
 /**
@@ -783,7 +887,9 @@ function InteractionActions({
           )}
         />
         <span className="text-foreground font-medium">{outcome.label}</span>
-        {isApproval ? <span className="truncate">{toolLabel}</span> : null}
+        <span className="truncate">
+          {isApproval ? toolLabel : (request.title ?? request.prompt)}
+        </span>
       </div>
     );
   }

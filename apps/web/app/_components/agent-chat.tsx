@@ -42,6 +42,8 @@ import type { AgentAnswer } from "./agent-message";
 
 const DEFAULT_AGENT_NAME = "eve TanStack Agent";
 const AGENT_NAME = WEB_CHAT_AGENT ?? DEFAULT_AGENT_NAME;
+const MODEL_UNAVAILABLE_MESSAGE =
+  "The model is temporarily unavailable. Please try again.";
 
 type EveAgent = UseEveAgentReturn;
 
@@ -54,11 +56,16 @@ interface PendingAssistant {
 /** Display state derived from the agent on each render. */
 interface ChatView {
   readonly activeSessionId: string | undefined;
-  /** Whether a running or paused turn exists for the Stop control to cancel. */
+  /**
+   * Whether there is a turn for the Stop control to cancel: one that is running
+   * or paused, or one a message the visitor just sent is about to start.
+   */
   readonly canCancel: boolean;
   readonly errorMessage: string | undefined;
   /** The empty assistant message hidden while the thinking indicator stands in for it. */
   readonly hiddenMessageId: string | undefined;
+  /** Whether the agent is working, rather than idle or waiting on a person. */
+  readonly isBusy: boolean;
   readonly isResuming: boolean;
   readonly showConversationLayout: boolean;
   readonly showPendingThinking: boolean;
@@ -121,7 +128,7 @@ export function AgentChat({
   };
 
   useChatHotkeys({
-    canCancel: view.canCancel,
+    canStop: view.isBusy && view.canCancel,
     composerRef,
     onCancel: () => {
       void requestCancellation();
@@ -234,17 +241,20 @@ export function AgentChat({
 
 /**
  * Registers the chat's keyboard shortcuts: `/` or `Mod+K` focuses the composer,
- * `Escape` stops the running or paused turn, and `Mod+Shift+O` starts a new chat.
+ * `Escape` stops a running turn, and `Mod+Shift+O` starts a new chat.
  *
  * @param options - The composer and the active turn's state.
  */
 function useChatHotkeys({
-  canCancel,
+  canStop,
   composerRef,
   onCancel,
 }: {
-  /** Whether a running or paused turn exists, which enables `Escape`. */
-  readonly canCancel: boolean;
+  /**
+   * Whether a turn is running, which enables `Escape`. A turn paused for an
+   * answer is left alone, so `Escape` in a text field doesn't withdraw it.
+   */
+  readonly canStop: boolean;
   /** The composer's textarea. */
   readonly composerRef: RefObject<HTMLTextAreaElement | null>;
   /** Stops the turn. */
@@ -255,7 +265,7 @@ function useChatHotkeys({
   };
   useHotkey("/", focusComposer);
   useHotkey("Mod+K", focusComposer);
-  useHotkey("Escape", onCancel, { enabled: canCancel });
+  useHotkey("Escape", onCancel, { enabled: canStop });
   useHotkey("Mod+Shift+O", () => {
     window.location.assign("/s");
   });
@@ -331,15 +341,20 @@ function getChatView(
   const pending = getPendingAssistant(agent, isBusy);
   const turnFailure =
     isBusy || isResuming ? undefined : getLatestTurnFailure(agent.view);
-  const errorMessage = actionError ?? agent.error?.message ?? turnFailure;
+  const agentError =
+    agent.error?.name === "MODEL_CALL_FAILED"
+      ? MODEL_UNAVAILABLE_MESSAGE
+      : agent.error?.message;
+  const errorMessage = actionError ?? agentError ?? turnFailure;
   const hasConversationContent =
     sessionless || agent.messages.length > 0 || errorMessage !== undefined;
 
   return {
     activeSessionId: sessionId ?? agent.session?.sessionId,
-    canCancel: !isResuming && activeTurn(agent.view) !== undefined,
+    canCancel: !isResuming && (isBusy || activeTurn(agent.view) !== undefined),
     errorMessage,
     hiddenMessageId: pending.hiddenMessageId,
+    isBusy,
     isResuming,
     showConversationLayout: isResuming || hasConversationContent,
     showPendingThinking: pending.showThinking,
@@ -486,7 +501,7 @@ function ComposerAction({
   readonly hasInputText: boolean;
   /** Whether the session is still catching up. */
   readonly isResuming: boolean;
-  /** Cancels the running turn. */
+  /** Cancels the running or paused turn. */
   readonly onCancel: () => void;
 }) {
   const attachments = usePromptInputAttachments();
@@ -611,6 +626,6 @@ function getLatestTurnFailure(view: EveAgent["view"]): string | undefined {
     return undefined;
   }
   return turnFailure.code === "MODEL_CALL_FAILED"
-    ? "The model is temporarily unavailable. Please try again."
+    ? MODEL_UNAVAILABLE_MESSAGE
     : turnFailure.message;
 }
