@@ -1,12 +1,7 @@
 import type { Spec } from "@json-render/react";
-import type {
-  ConversationInput,
-  EveAuthorizationPart,
-  EveDynamicToolPart,
-  EveMessage,
-  EveMessageInputRequest,
-  EveMessagePart,
-} from "eve/react";
+import { signInEnding } from "eve/events";
+import type { Answer, Interaction } from "eve/events";
+import type { EveMessage, EveMessagePart, EveToolPart } from "eve/react";
 import {
   CheckCircleIcon,
   ChevronRightIcon,
@@ -38,6 +33,7 @@ import {
   ToolInput,
   ToolOutput,
 } from "@/components/ai-elements/tool";
+import type { ToolHeaderProps } from "@/components/ai-elements/tool";
 import { Button } from "@/components/ui/button";
 import {
   Collapsible,
@@ -60,27 +56,19 @@ import { cn } from "@/lib/utils";
 
 import { GeneratedUi, uiSpecSchema } from "./ui-registry";
 
-/** A visitor's answer to a question or approval request. */
-export interface AgentInputResponse {
-  /** The chosen option, for a multiple-choice request. */
-  readonly optionId?: string;
-  /** The request being answered. */
-  readonly requestId: string;
-  /** The typed answer, for a free-form request. */
-  readonly text?: string;
-}
-
 type EveFilePart = Extract<EveMessagePart, { type: "file" }>;
-type AuthorizationOutcome = NonNullable<EveAuthorizationPart["outcome"]>;
-type OnInputResponses = (
-  responses: readonly AgentInputResponse[]
-) => void | Promise<void>;
+type CanRespond = (interactionId: string) => boolean;
+type OnInputResponses = (responses: readonly Answer[]) => Promise<void>;
 
-const AUTHORIZATION_OUTCOME_LABEL: Record<AuthorizationOutcome, string> = {
-  authorized: "Connected",
+const AUTHORIZATION_OUTCOME_LABEL: Record<
+  ReturnType<typeof signInEnding>,
+  string
+> = {
+  cancelled: "Cancelled",
+  connected: "Connected",
   declined: "Declined",
   failed: "Failed",
-  "timed-out": "Timed out",
+  "timed out": "Timed out",
 };
 
 /**
@@ -94,18 +82,15 @@ export function AgentMessage({
   isStreaming,
   message,
   onInputResponses,
-  questionsFor,
 }: {
-  /** Whether the request with this ID still accepts an answer. */
-  readonly canRespond: (requestId: string) => boolean;
+  /** Whether the interaction with this ID still accepts an answer. */
+  readonly canRespond: CanRespond;
   /** Whether this message is the one currently streaming. */
   readonly isStreaming: boolean;
   /** The message to render. */
   readonly message: EveMessage;
   /** Submits answers to questions and approvals. */
   readonly onInputResponses: OnInputResponses;
-  /** Returns every question the tool call with this ID asked. */
-  readonly questionsFor: (callId: string) => readonly ConversationInput[];
 }) {
   const lastTextIndex = message.parts.findLastIndex(
     (part) => part.type === "text"
@@ -129,7 +114,6 @@ export function AgentMessage({
               key={partKey(part, index)}
               onInputResponses={onInputResponses}
               part={part}
-              questionsFor={questionsFor}
               showCaret={
                 isStreaming &&
                 message.role === "assistant" &&
@@ -154,24 +138,18 @@ function AgentMessagePart({
   canRespond,
   onInputResponses,
   part,
-  questionsFor,
   showCaret,
 }: {
-  /** Whether the request with this ID still accepts an answer. */
-  readonly canRespond: (requestId: string) => boolean;
+  /** Whether the interaction with this ID still accepts an answer. */
+  readonly canRespond: CanRespond;
   /** Submits answers to questions and approvals. */
   readonly onInputResponses: OnInputResponses;
   /** The part to render. */
   readonly part: EveMessagePart;
-  /** Returns every question the tool call with this ID asked. */
-  readonly questionsFor: (callId: string) => readonly ConversationInput[];
   /** Whether to show the streaming caret after this text part. */
   readonly showCaret: boolean;
 }) {
   switch (part.type) {
-    case "step-start": {
-      return null;
-    }
     case "text": {
       return (
         <MessageResponse caret="block" isAnimating={showCaret}>
@@ -190,12 +168,16 @@ function AgentMessagePart({
     case "file": {
       return <AttachmentPart part={part} />;
     }
-    case "authorization": {
-      return <AuthorizationPrompt part={part} />;
+    case "interaction": {
+      return (
+        <InteractionPrompt
+          canRespond={canRespond(part.interactionId)}
+          interaction={part}
+          onInputResponses={onInputResponses}
+        />
+      );
     }
-    case "dynamic-tool": {
-      const questions = questionsFor(part.toolCallId);
-      const inputRequest = part.toolMetadata?.eve?.inputRequest;
+    case "tool": {
       const spec = renderUiSpec(part);
       if (spec === null) {
         return null;
@@ -203,54 +185,12 @@ function AgentMessagePart({
       if (spec !== undefined) {
         return <GeneratedUi spec={spec} />;
       }
-      if (questions.length > 0) {
-        return (
-          <div className="space-y-4">
-            {questions.map(({ request, response }) => (
-              <QuestionRequest
-                canRespond={canRespond(request.requestId)}
-                inputRequest={request}
-                inputResponse={response}
-                key={request.requestId}
-                onInputResponses={onInputResponses}
-              />
-            ))}
-          </div>
-        );
-      }
-
       return (
-        <>
-          <Tool>
-            <ToolHeader
-              state={part.state}
-              title={part.toolMetadata?.eve?.label ?? part.toolName}
-              toolName={part.toolName}
-              type="dynamic-tool"
-            />
-            <ToolContent>
-              {part.toolName === "bash" ? (
-                <BashToolContent
-                  errorText={part.errorText}
-                  input={part.input}
-                  output={part.output}
-                />
-              ) : (
-                <>
-                  <ToolInput input={part.input} />
-                  <ToolOutput errorText={part.errorText} output={part.output} />
-                </>
-              )}
-            </ToolContent>
-          </Tool>
-          {inputRequest === undefined ? null : (
-            <InputRequestActions
-              canRespond={canRespond}
-              part={part}
-              onInputResponses={onInputResponses}
-            />
-          )}
-        </>
+        <ToolPart
+          canRespond={canRespond}
+          onInputResponses={onInputResponses}
+          part={part}
+        />
       );
     }
     default: {
@@ -259,6 +199,70 @@ function AgentMessagePart({
   }
 }
 
+function ToolPart({
+  canRespond,
+  onInputResponses,
+  part,
+}: {
+  readonly canRespond: CanRespond;
+  readonly onInputResponses: OnInputResponses;
+  readonly part: EveToolPart;
+}) {
+  const { interaction } = part;
+  return (
+    <>
+      {interaction?.request.kind === "question" ? null : (
+        <Tool>
+          <ToolHeader
+            state={TOOL_HEADER_STATE[part.state]}
+            title={part.label}
+            toolName={part.name}
+            type="dynamic-tool"
+          />
+          <ToolContent>
+            {part.name === "bash" ? (
+              <BashToolContent
+                errorText={part.error?.message}
+                input={part.input}
+                output={part.output}
+              />
+            ) : (
+              <>
+                <ToolInput input={part.input} />
+                <ToolOutput
+                  errorText={part.error?.message}
+                  output={part.output}
+                />
+              </>
+            )}
+          </ToolContent>
+        </Tool>
+      )}
+      {interaction === undefined ? null : (
+        <InteractionPrompt
+          canRespond={canRespond(interaction.interactionId)}
+          interaction={interaction}
+          key={interaction.interactionId}
+          onInputResponses={onInputResponses}
+          toolLabel={part.label}
+        />
+      )}
+    </>
+  );
+}
+
+const TOOL_HEADER_STATE = {
+  approval: "approval-requested",
+  blocked: "input-available",
+  cancelled: "output-error",
+  completed: "output-available",
+  failed: "output-error",
+  rejected: "output-denied",
+  requested: "input-available",
+  running: "input-available",
+  streaming: "input-streaming",
+} satisfies Record<EveToolPart["state"], ToolHeaderProps["state"]>;
+
 /**
  * Resolves what a tool part shows as generated UI.
  *
@@ -266,15 +270,52 @@ function AgentMessagePart({
  * @returns The spec to render, `null` to hide a rejected `render_ui` call, or
  * `undefined` for other tools and for input that is still streaming in.
  */
-function renderUiSpec(part: EveDynamicToolPart): Spec | null | undefined {
-  if (part.toolName !== "render_ui") {
+function renderUiSpec(part: EveToolPart): Spec | null | undefined {
+  if (part.name !== "render_ui") {
     return undefined;
   }
-  if (part.state === "output-error") {
+  if (
+    part.state === "failed" ||
+    part.state === "rejected" ||
+    part.state === "cancelled"
+  ) {
     return null;
   }
   const parsed = uiSpecSchema.safeParse(part.input);
   return parsed.success ? parsed.data : undefined;
+}
+
+function InteractionPrompt({
+  canRespond,
+  interaction,
+  onInputResponses,
+  toolLabel,
+}: {
+  readonly canRespond: boolean;
+  readonly interaction: Interaction;
+  readonly onInputResponses: OnInputResponses;
+  readonly toolLabel?: string;
+}) {
+  if (interaction.request.kind === "sign-in") {
+    return <AuthorizationPrompt interaction={interaction} />;
+  }
+  if (interaction.request.kind === "question") {
+    return (
+      <QuestionRequest
+        canRespond={canRespond}
+        interaction={interaction}
+        onInputResponses={onInputResponses}
+      />
+    );
+  }
+  return (
+    <InputRequestActions
+      canRespond={canRespond}
+      interaction={interaction}
+      onInputResponses={onInputResponses}
+      toolLabel={toolLabel}
+    />
+  );
 }
 
 /**
@@ -286,66 +327,63 @@ function renderUiSpec(part: EveDynamicToolPart): Spec | null | undefined {
  */
 function QuestionRequest({
   canRespond,
-  inputRequest,
-  inputResponse,
+  interaction,
   onInputResponses,
 }: {
   /** Whether the question still accepts an answer. */
   readonly canRespond: boolean;
-  /** The question. */
-  readonly inputRequest: EveMessageInputRequest;
-  /** The submitted answer, once there is one. */
-  readonly inputResponse?: AgentInputResponse;
+  /** The question and any recorded answer. */
+  readonly interaction: Interaction;
   /** Submits the answer. */
   readonly onInputResponses: OnInputResponses;
 }) {
-  const [submittedResponse, setSubmittedResponse] =
-    useState<AgentInputResponse>();
-  const options = inputRequest.options ?? [];
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const { answer, interactionId, request } = interaction;
+  const options = request.options ?? [];
   const acceptsFreeform =
-    inputRequest.allowFreeform === true || options.length === 0;
-  const answeredResponse =
-    inputResponse ?? (canRespond ? undefined : submittedResponse);
+    request.allowFreeform === true || options.length === 0;
+  const isLocked = !canRespond || isSubmitting;
 
-  if (answeredResponse !== undefined) {
-    return (
-      <AnsweredQuestion
-        inputRequest={inputRequest}
-        inputResponse={answeredResponse}
-      />
-    );
+  if (interaction.status === "settled" && answer !== undefined) {
+    return <AnsweredQuestion inputRequest={request} inputResponse={answer} />;
   }
 
-  const submitResponse = (event: SubmitEvent<HTMLFormElement>) => {
+  const submitResponse = async (event: SubmitEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const answer = new FormData(event.currentTarget).get(
-      inputRequest.requestId
-    );
-    if (answer === null || answer instanceof File) {
+    const value = z
+      .string()
+      .safeParse(new FormData(event.currentTarget).get(interactionId));
+    if (isLocked || !value.success) {
       return;
     }
 
-    const option = options.find(({ id }) => id === answer);
-    const response: AgentInputResponse =
+    const option = options.find(({ id }) => id === value.data);
+    setIsSubmitting(true);
+    await onInputResponses([
       option === undefined
-        ? { requestId: inputRequest.requestId, text: answer.trim() }
-        : { optionId: option.id, requestId: inputRequest.requestId };
-    setSubmittedResponse(response);
-    void onInputResponses([response]);
+        ? { interactionId, text: value.data.trim() }
+        : { interactionId, optionId: option.id },
+    ]);
+    setIsSubmitting(false);
   };
 
   return (
     <div className="border-info/30 bg-info/5 w-full max-w-md rounded-md border p-3">
-      <Questionnaire className="gap-3" onSubmit={submitResponse}>
-        <QuestionnaireItem name={inputRequest.requestId} required>
+      <Questionnaire
+        className="gap-3"
+        onSubmit={(event) => {
+          void submitResponse(event);
+        }}
+      >
+        <QuestionnaireItem name={interactionId} required>
           <QuestionnaireTitle className="text-sm font-medium [&:not(:has(~[data-slot=questionnaire-description]))]:mb-3">
-            {inputRequest.prompt}
+            {request.prompt}
           </QuestionnaireTitle>
           <QuestionnaireChoices className="gap-2">
             {options.map((option) => (
               <QuestionnaireChoice
                 className="min-h-0 px-3 py-2"
-                disabled={!canRespond}
+                disabled={isLocked}
                 key={option.id}
                 value={option.id}
               >
@@ -360,7 +398,7 @@ function QuestionRequest({
             {acceptsFreeform ? (
               <QuestionnaireInput
                 aria-label="Answer"
-                disabled={!canRespond}
+                disabled={isLocked}
                 placeholder="Type your answer…"
               />
             ) : null}
@@ -368,7 +406,7 @@ function QuestionRequest({
           <QuestionnaireError />
         </QuestionnaireItem>
         <QuestionnaireActions>
-          <QuestionnaireSubmit disabled={!canRespond} size="sm">
+          <QuestionnaireSubmit disabled={isLocked} size="sm">
             Answer
           </QuestionnaireSubmit>
         </QuestionnaireActions>
@@ -389,9 +427,9 @@ function AnsweredQuestion({
   inputResponse,
 }: {
   /** The question. */
-  readonly inputRequest: EveMessageInputRequest;
+  readonly inputRequest: Interaction["request"];
   /** The submitted answer. */
-  readonly inputResponse: AgentInputResponse;
+  readonly inputResponse: Answer;
 }) {
   const options = inputRequest.options ?? [];
   const answer =
@@ -520,13 +558,17 @@ function AttachmentPart({
  * @returns The authorization card.
  */
 function AuthorizationPrompt({
-  part,
+  interaction,
 }: {
-  /** The authorization part. */
-  readonly part: EveAuthorizationPart;
+  /** The connection sign-in interaction. */
+  readonly interaction: Interaction;
 }) {
-  if (part.state === "completed") {
-    const authorized = part.outcome === "authorized";
+  const { outcome, reason, request, status } = interaction;
+  const { prompt, signIn } = request;
+  const name = signIn?.displayName ?? signIn?.name ?? "the service";
+  if (status === "settled") {
+    const ending = signInEnding(outcome ?? "failed");
+    const authorized = ending === "connected";
     const Icon = authorized ? CheckCircleIcon : XCircleIcon;
     return (
       <div className="text-muted-foreground flex w-full max-w-md items-center gap-2 rounded-md border px-3 py-2 text-sm">
@@ -537,28 +579,25 @@ function AuthorizationPrompt({
           )}
         />
         <span className="text-foreground font-medium">
-          {AUTHORIZATION_OUTCOME_LABEL[part.outcome]}
+          {AUTHORIZATION_OUTCOME_LABEL[ending]}
         </span>
         <span className="truncate">
-          {part.reason === undefined
-            ? part.displayName
-            : `${part.displayName} (${part.reason})`}
+          {reason === undefined ? name : `${name} (${reason})`}
         </span>
       </div>
     );
   }
 
-  const instructions = part.authorization?.instructions;
-  const userCode = part.authorization?.userCode;
-  const signInUrl = part.authorization?.url;
+  const instructions = signIn?.instructions;
+  const userCode = signIn?.userCode;
+  const signInUrl = signIn?.url;
 
   return (
     <div className="border-info/30 bg-info/5 w-full max-w-md space-y-3 rounded-md border p-3">
       <div className="space-y-1">
-        <p className="text-sm font-medium">Connect {part.displayName}</p>
-        <p className="text-muted-foreground text-sm">{part.description}</p>
-        {instructions === undefined ||
-        instructions === part.description ? null : (
+        <p className="text-sm font-medium">Connect {name}</p>
+        <p className="text-muted-foreground text-sm">{prompt}</p>
+        {instructions === undefined || instructions === prompt ? null : (
           <p className="text-muted-foreground text-sm">{instructions}</p>
         )}
       </div>
@@ -572,7 +611,7 @@ function AuthorizationPrompt({
         <Button asChild size="sm">
           <a href={signInUrl} rel="noreferrer" target="_blank">
             <ExternalLinkIcon className="size-4" />
-            Sign in with {part.displayName}
+            Sign in with {name}
           </a>
         </Button>
       )}
@@ -625,41 +664,26 @@ const inputSummarySchema = z
   );
 
 /**
- * Resolves a settled request to the text shown in place of its buttons.
- *
- * @param part - The tool call part.
- * @param inputRequest - The request.
- * @param inputResponse - The visitor's answer, if recorded.
- * @returns The outcome, or `undefined` while the request is open.
+ * Labels settled interactions that did not produce a displayed answer.
  */
-function settledOutcome(
-  part: EveDynamicToolPart,
-  inputRequest: EveMessageInputRequest,
-  inputResponse: AgentInputResponse | undefined
-):
-  | { readonly approved: boolean | undefined; readonly label: string }
-  | undefined {
-  const options = inputRequest.options ?? [];
-  if (inputRequest.kind === "tool-approval") {
-    const approved =
-      part.approval?.approved ??
-      (inputResponse?.optionId === undefined
-        ? undefined
-        : inputResponse.optionId === "approve");
-    if (approved === undefined) {
-      return undefined;
-    }
-    return { approved, label: approved ? "Approved" : "Cancelled" };
+const INTERACTION_OUTCOME_LABEL = {
+  abandoned: "Abandoned",
+  accepted: "Approved",
+  declined: "Cancelled",
+  expired: "Expired",
+  failed: "Failed",
+  interrupted: "Interrupted",
+  invalid: "Invalid response",
+  withdrawn: "Withdrawn",
+} satisfies Record<NonNullable<Interaction["outcome"]>, string>;
+
+function settledOutcome(interaction: Interaction): string {
+  const { answer, outcome, request } = interaction;
+  if (request.kind !== "approval" && answer !== undefined) {
+    const selected = request.options?.find(({ id }) => id === answer.optionId);
+    return selected?.label ?? answer.text ?? answer.optionId ?? "Answered";
   }
-  if (inputResponse === undefined) {
-    return undefined;
-  }
-  const selected = options.find(({ id }) => id === inputResponse.optionId);
-  return {
-    approved: undefined,
-    label:
-      selected?.label ?? inputResponse.text ?? inputResponse.optionId ?? "",
-  };
+  return outcome === undefined ? "Ended" : INTERACTION_OUTCOME_LABEL[outcome];
 }
 
 /**
@@ -667,45 +691,44 @@ function settledOutcome(
  * shows the decision once made.
  *
  * @param props - The component props.
- * @returns The approval card, or `null` when the tool call asks for nothing.
+ * @returns The approval card.
  */
 function InputRequestActions({
   canRespond,
+  interaction,
   onInputResponses,
-  part,
+  toolLabel,
 }: {
-  /** Whether the request with this ID still accepts an answer. */
-  readonly canRespond: (requestId: string) => boolean;
+  /** Whether the interaction still accepts an answer. */
+  readonly canRespond: boolean;
+  /** The interaction and any recorded decision. */
+  readonly interaction: Interaction;
   /** Submits the chosen option. */
   readonly onInputResponses: OnInputResponses;
-  /** The tool call part. */
-  readonly part: EveDynamicToolPart;
+  /** The label from the corresponding tool card, when there is one. */
+  readonly toolLabel?: string;
 }) {
-  const eve = part.toolMetadata?.eve;
-  const inputRequest = eve?.inputRequest;
-  if (inputRequest === undefined) {
-    return null;
-  }
-
-  const isApproval = inputRequest.kind === "tool-approval";
-  const outcome = settledOutcome(part, inputRequest, eve?.inputResponse);
-  const summary = inputSummarySchema.safeParse(part.input);
+  const { call, interactionId, outcome, request, status } = interaction;
+  const isApproval = request.kind === "approval";
+  const title = toolLabel ?? request.title ?? call?.name ?? request.prompt;
+  const summary = inputSummarySchema.safeParse(call?.input);
   const details = isApproval && summary.success ? summary.data : [];
 
-  if (outcome !== undefined) {
-    const Icon = outcome.approved === false ? XCircleIcon : CheckCircleIcon;
+  if (status === "settled") {
+    const accepted = outcome === "accepted";
+    const Icon = accepted ? CheckCircleIcon : XCircleIcon;
     return (
       <div className="text-muted-foreground flex w-full max-w-md items-center gap-2 rounded-md border px-3 py-2 text-sm">
         <Icon
           className={cn(
             "size-4 shrink-0",
-            outcome.approved === false ? "text-destructive" : "text-success"
+            accepted ? "text-success" : "text-destructive"
           )}
         />
-        <span className="text-foreground font-medium">{outcome.label}</span>
-        {isApproval ? (
-          <span className="truncate">{eve?.label ?? part.toolName}</span>
-        ) : null}
+        <span className="text-foreground font-medium">
+          {settledOutcome(interaction)}
+        </span>
+        {isApproval ? <span className="truncate">{title}</span> : null}
       </div>
     );
   }
@@ -714,7 +737,7 @@ function InputRequestActions({
     <div className="border-warning/30 bg-warning/5 w-full max-w-md space-y-3 rounded-md border p-3">
       <div className="space-y-1">
         <p className="text-sm font-medium">
-          {isApproval ? (eve?.label ?? part.toolName) : inputRequest.prompt}
+          {isApproval ? title : request.prompt}
         </p>
         {isApproval ? (
           <p className="text-muted-foreground text-sm">
@@ -738,17 +761,12 @@ function InputRequestActions({
         </dl>
       ) : null}
       <div className="flex flex-wrap gap-2">
-        {inputRequest.options?.map((option, index) => (
+        {request.options?.map((option, index) => (
           <Button
-            disabled={!canRespond(inputRequest.requestId)}
+            disabled={!canRespond}
             key={option.id}
             onClick={() => {
-              void onInputResponses([
-                {
-                  optionId: option.id,
-                  requestId: inputRequest.requestId,
-                },
-              ]);
+              void onInputResponses([{ interactionId, optionId: option.id }]);
             }}
             size="sm"
             type="button"
@@ -788,20 +806,17 @@ function optionVariant(
  */
 function partKey(part: EveMessagePart, index: number): string {
   switch (part.type) {
-    case "authorization": {
-      return part.attemptId === undefined
-        ? `authorization:${part.turnId}:${part.stepIndex}:${part.name}`
-        : `authorization:${part.attemptId}`;
+    case "interaction": {
+      return `interaction:${part.interactionId}`;
     }
-    case "dynamic-tool": {
-      return part.toolCallId;
+    case "tool": {
+      return part.callId;
     }
     case "reasoning":
     case "text": {
       return `${part.type}:${part.id ?? index}`;
     }
-    case "file":
-    case "step-start": {
+    case "file": {
       return `${part.type}:${index}`;
     }
     default: {
