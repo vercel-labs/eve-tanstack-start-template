@@ -1,12 +1,10 @@
 import { useHotkey } from "@tanstack/react-hotkeys";
-import type { UserContent } from "ai";
 import { ClientError } from "eve/client";
+import type { MessagePart } from "eve/client";
+import { failure, interaction, turns } from "eve/events";
+import type { Answer } from "eve/events";
 import { useEveAgent } from "eve/react";
-import type {
-  ConversationInput,
-  ConversationState,
-  UseEveAgentHelpers,
-} from "eve/react";
+import type { UseEveAgentReturn } from "eve/react";
 import { AlertCircleIcon, BrainIcon, PlusIcon, SquareIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
@@ -34,12 +32,9 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
 import { AgentMessage } from "./agent-message";
-import type { AgentInputResponse } from "./agent-message";
 
 const DEFAULT_AGENT_NAME = "eve TanStack Agent";
 const AGENT_NAME = WEB_CHAT_AGENT ?? DEFAULT_AGENT_NAME;
-
-type EveAgent = UseEveAgentHelpers<ConversationState>;
 
 /** Whether to show the thinking indicator, and the empty assistant message it replaces. */
 interface PendingAssistant {
@@ -306,7 +301,7 @@ async function readAccessStatus(): Promise<AccessStatus | null> {
  * @returns The derived {@link ChatView}.
  */
 function getChatView(
-  agent: EveAgent,
+  agent: UseEveAgentReturn,
   {
     actionError,
     sessionId,
@@ -320,14 +315,14 @@ function getChatView(
     readonly sessionless: boolean;
   }
 ): ChatView {
-  const isBusy = agent.status === "submitted" || agent.status === "streaming";
+  const isBusy = agent.status === "busy";
   const isResuming = agent.status === "resuming";
   const pending = getPendingAssistant(agent, isBusy);
   const turnFailure =
-    isBusy || isResuming ? undefined : getLatestTurnFailure(agent.events);
+    isBusy || isResuming ? undefined : getLatestTurnFailure(agent.view);
   const errorMessage = actionError ?? agent.error?.message ?? turnFailure;
   const hasConversationContent =
-    sessionless || agent.data.messages.length > 0 || errorMessage !== undefined;
+    sessionless || agent.messages.length > 0 || errorMessage !== undefined;
 
   return {
     activeSessionId: sessionId ?? agent.session?.sessionId,
@@ -342,29 +337,27 @@ function getChatView(
 
 /**
  * Decides whether to show the thinking indicator, and which empty assistant
- * message (one with only `step-start` parts) it replaces.
+ * message it replaces.
  *
  * @param agent - The `useEveAgent` result.
- * @param isBusy - Whether a turn is submitted or streaming.
+ * @param isBusy - Whether the agent has outstanding work.
  * @returns Whether to show the indicator, and the message ID it hides.
  */
 function getPendingAssistant(
-  agent: EveAgent,
+  agent: UseEveAgentReturn,
   isBusy: boolean
 ): PendingAssistant {
-  const lastMessage = agent.data.messages.at(-1);
+  const lastMessage = agent.messages.at(-1);
   if (!isBusy) {
     return { hiddenMessageId: undefined, showThinking: false };
   }
   if (lastMessage?.role !== "assistant") {
     return { hiddenMessageId: undefined, showThinking: true };
   }
-  const isEmptyShell = lastMessage.parts.every(
-    (part) => part.type === "step-start"
-  );
+  const isEmptyShell = lastMessage.parts.length === 0;
   return {
     hiddenMessageId: isEmptyShell ? lastMessage.id : undefined,
-    showThinking: agent.status === "submitted" || isEmptyShell,
+    showThinking: isEmptyShell,
   };
 }
 
@@ -378,8 +371,8 @@ function getPendingAssistant(
 function toUserContent(
   text: string,
   files: PromptInputMessage["files"]
-): UserContent {
-  const parts: UserContent = [];
+): readonly MessagePart[] {
+  const parts: MessagePart[] = [];
   if (text.length > 0) {
     parts.push({ text, type: "text" });
   }
@@ -407,25 +400,23 @@ function ChatConversation({
   view,
 }: {
   /** The `useEveAgent` result. */
-  readonly agent: EveAgent;
+  readonly agent: UseEveAgentReturn;
   /** Whether the page opened on an existing session. */
   readonly isInitialSession: boolean;
   /** Submits answers to questions and approvals. */
-  readonly onInputResponses: (
-    responses: readonly AgentInputResponse[]
-  ) => Promise<void>;
+  readonly onInputResponses: (responses: readonly Answer[]) => Promise<void>;
   /** The derived {@link ChatView}. */
   readonly view: ChatView;
 }) {
-  const { messages } = agent.data;
-  const canRespond = (requestId: string) =>
-    !view.isResuming && agent.data.inputs[requestId]?.status === "open";
-  const questionsFor = (callId: string): ConversationInput[] =>
-    Object.values(agent.data.inputs).filter(
-      (input) =>
-        input.request.kind === "question" &&
-        input.request.action.callId === callId
+  const { messages } = agent;
+  const canRespond = (interactionId: string) => {
+    const prompt = interaction(agent.view, interactionId);
+    return (
+      !view.isResuming &&
+      prompt?.status === "open" &&
+      prompt.answer === undefined
     );
+  };
   const scrollKey =
     messages.length > 0 && view.activeSessionId !== undefined
       ? `eve:web-chat-scroll:${view.activeSessionId}`
@@ -445,13 +436,13 @@ function ChatConversation({
             <AgentMessage
               canRespond={canRespond}
               isStreaming={
-                agent.status === "streaming" &&
+                view.isBusy &&
+                message.metadata?.status === "streaming" &&
                 message.id === messages.at(-1)?.id
               }
               key={message.id}
               message={message}
               onInputResponses={onInputResponses}
-              questionsFor={questionsFor}
             />
           )
         )}
@@ -597,29 +588,16 @@ function PendingThinking() {
 }
 
 /**
- * Finds the latest turn failure, ignoring failures a later turn or message superseded.
+ * Finds the failure of the latest turn or of the session itself.
  *
- * @param events - The agent's event log.
- * @returns A user-facing failure message, or `undefined` when the latest turn did not fail.
+ * @param view - The agent's committed session view.
+ * @returns A user-facing failure message, if any.
  */
-function getLatestTurnFailure(events: EveAgent["events"]): string | undefined {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-
-    if (event.type === "turn.failed") {
-      return event.data.code === "MODEL_CALL_FAILED"
-        ? "The model is temporarily unavailable. Please try again."
-        : event.data.message;
-    }
-
-    if (
-      event.type === "turn.completed" ||
-      event.type === "turn.cancelled" ||
-      event.type === "message.received"
-    ) {
-      return undefined;
-    }
-  }
-
-  return undefined;
+function getLatestTurnFailure(
+  view: UseEveAgentReturn["view"]
+): string | undefined {
+  const turnFailure = failure(view, turns(view).at(-1)?.turnId);
+  return turnFailure?.code === "MODEL_CALL_FAILED"
+    ? "The model is temporarily unavailable. Please try again."
+    : turnFailure?.message;
 }
